@@ -1,0 +1,15 @@
+.novel_extractor_work/
+__pycache__/
+model/*.local.json
+.env
+.DS_Store
+.novel_agent_work/
+logs/
+.venv/
+.tmp_test/
+reports/
+repository/
+novel_data/
+HANDOFF*.md
+model/config.formal*.json
+.pytest_cache/

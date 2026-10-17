@@ -1,0 +1,8 @@
+{
+  "api_url": "https://api.deepseek.com/chat/completions",
+  "model": "deepseek-flash",
+  "api_key_env": "DEEPSEEK_API_KEY",
+  "timeout_seconds": 600,
+  "max_retries": 20,
+  "max_calls": 1000
+}
