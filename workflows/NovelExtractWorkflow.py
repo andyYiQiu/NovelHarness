@@ -1036,9 +1036,10 @@ class NovelExtractWorkflow:
     @staticmethod
     def _review_round_available(state, review_rounds):
         normal = state.rounds < review_rounds
-        final_handoff = (state.rounds < review_rounds + 2
-                         and len(state.history) >= review_rounds
-                         and state.history[review_rounds - 1].get('final_time_handoff'))
+        handoff_round = next((item['round'] for item in reversed(state.history)
+                              if item.get('final_time_handoff')), None)
+        final_handoff = (handoff_round is not None
+                         and state.rounds < handoff_round + 2)
         return normal or final_handoff
 
     async def _request_global_delivery(self, task, job, chunks, world, state):
@@ -1145,7 +1146,8 @@ class NovelExtractWorkflow:
         state.feedback[task] = {'summary': review.summary, 'model_issues': model_issues,
                                 'program_feedback': program_feedback}
         old_ids = {event.id for event in world.events}
-        final_time_handoff = (state.rounds == review_rounds and task == 'review'
+        final_time_handoff = (review_rounds - 1 <= state.rounds <= review_rounds
+                              and task == 'review'
                               and any(event.id not in old_ids and
                                       (event.time_node_id is None or event.event_order is None)
                                       for event in candidate.events))

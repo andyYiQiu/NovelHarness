@@ -5,6 +5,8 @@ import unittest
 from common.novel_extract.NovelExtractReader import chunk_text
 from common.novel_extract.NovelExtractSchema import (
     CandidateCheck,
+    Change,
+    ChangeRemoval,
     Correction,
     Entity,
     Event,
@@ -12,6 +14,8 @@ from common.novel_extract.NovelExtractSchema import (
     EventRemoval,
     Evidence,
     OccurrenceSignature,
+    Relation,
+    RelationRemoval,
     Review,
     TimeCheck,
     TimeNode,
@@ -149,6 +153,46 @@ class SafetyContractTests(unittest.TestCase):
         )
         candidate, _ = workflow.evaluate_review(review, world, self.chunks)
         self.assertEqual([item.id for item in candidate.events], ["GOOD"])
+
+    def test_agent_explicitly_repairs_references_when_replacing_an_event(self):
+        bad = event("BAD", actor="ENT_2", layer="获知")
+        good = event("GOOD")
+        later = event("LATER", actor="ENT_2")
+        old_relation = Relation(source="BAD", target="LATER", kind="causes", basis="旧因果")
+        old_change = Change(event_id="BAD", subject_id="ENT_2", change="乙获知消息", basis="原文")
+        world = self.world.model_copy(update={
+            "events": [bad, later],
+            "relations": [old_relation],
+            "changes": [old_change],
+        })
+        removal = EventRemoval(id="BAD", reason="实际发生不能由获知替代",
+                               signature=bad.occurrence_signature)
+        incomplete = Review(
+            is_valid=False, summary="以正确实际发生替代错误获知事件", issues=[], covered_chunks=[],
+            correction=Correction(events=[good], removals=[removal]),
+        )
+        workflow = NovelExtractWorkflow()
+        workflow.storage = StorageStub(self.reading_candidate)
+        with self.assertRaisesRegex(ValueError, "非法事件引用|非法引用"):
+            workflow.apply_review_correction(world, incomplete, self.chunks, None)
+
+        review = Review(
+            is_valid=False, summary="检查智能体逐条处理旧引用", issues=[], covered_chunks=[],
+            correction=Correction(
+                events=[good], removals=[removal],
+                relation_removals=[RelationRemoval(**old_relation.model_dump(), reason="改正因果主体")],
+                relations=[Relation(source="GOOD", target="LATER", kind="causes", basis="原文支持")],
+                change_removals=[ChangeRemoval(**old_change.model_dump(), reason="旧获知状态不属于实际事件")],
+                changes=[Change(event_id="GOOD", subject_id="ENT_1", change="甲开始新的经历", basis="原文")],
+            ),
+        )
+        revised = workflow.apply_review_correction(world, review, self.chunks, None)
+        self.assertEqual({item.id for item in revised.events}, {"GOOD", "LATER"})
+        self.assertEqual(revised.relations[0].source, "GOOD")
+        self.assertEqual(revised.relations[0].basis, "原文支持")
+        self.assertEqual(revised.changes[0].event_id, "GOOD")
+        self.assertEqual(revised.changes[0].change, "甲开始新的经历")
+        self.assertEqual([item.id for item in world.events], ["BAD", "LATER"])
 
     @unittest.skip("Legacy proof-table protocol retired; see reports/novel_extract/shadowloom_validation_reset_20261016/retired_tests.md")
     def test_candidate_signature_survives_accepted_entity_redirect(self):

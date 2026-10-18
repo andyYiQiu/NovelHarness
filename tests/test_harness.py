@@ -2298,6 +2298,31 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(saved['EVT_C1_E1']['description'], '甲出发')
         self.assertTrue(NovelExtractStorage.read_status(self.workspace)['review_state']['accepted'])
 
+    def test_penultimate_round_new_fact_gets_review_after_final_timeline(self):
+        class PenultimateFacts(FixtureServer):
+            def reply(self, job, attempt, context):
+                result = super().reply(job, attempt, context)
+                if job.startswith('global.review.'):
+                    index = int(job.rsplit('.', 1)[-1])
+                    if index < 3:
+                        result['is_valid'] = False
+                        result['issues'] = ['继续核对']
+                        result['correction']['world_traits'] = {f'WORLD_{index}': f'事实{index}'}
+                    elif index == 3:
+                        result['correction']['events'] = [event(
+                            1, id='EVT_C1_LATE', description='甲到达',
+                            occurrence_signature={**occurrence_signature(1), 'occurrence': '甲到达'},
+                            time_node_id=None, event_order=None).model_dump(mode='json')]
+                return result
+
+        server = PenultimateFacts()
+        self.assertEqual(self.run_pipeline(server, chunks=1), 0)
+        jobs = [job for job, _, _ in server.requests if job.startswith('global.')]
+        self.assertEqual(jobs[-3:], ['global.review.3', 'global.timeline.1', 'global.review.4'])
+        saved = {item['id']: item for item in self.snapshots()['world']['events']}
+        self.assertIsNotNone(saved['EVT_C1_LATE']['time_node_id'])
+        self.assertTrue(NovelExtractStorage.read_status(self.workspace)['review_state']['accepted'])
+
     def test_second_pass_keeps_distinct_or_ambiguous_occurrences(self):
         first = event(1)
         distinct = event(1, id='EVT_C1_S1', description='甲实际抵达',
