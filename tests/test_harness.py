@@ -15,7 +15,7 @@ import httpx
 
 from common.novel_extract.NovelExtractReader import chunk_text, compact_evidence
 from common.novel_extract.NovelExtractSchema import (
-    CandidateCheck, Change, ChangeRemoval, CoreCandidate, CoreChainCheck, Correction, Entities, Entity, EventMerge, Event, EventPass,
+    CandidateCheck, Change, ChangeRemoval, CoreCandidate, CoreChainCheck, Correction, Entities, Entity, EventMerge, EventRemoval, Event, EventPass,
     Evidence, Foundation, FoundationReview, OccurrenceSignature, Reading, Relation, RelationRemoval, RepositoryInformation, Review, StoryLink,
     GroupedTimeline, TimeCheck, TimeNode, TimePlacement, Timeline, TimelinePlan, World, apply_correction, apply_information, apply_timeline, evidence_errors,
     fact_dependencies, information_dependency, time_comparisons, time_dependencies, canonical_keys, normalize_evidence, normalize_references, information_errors, register_errors, timeline_errors, topology_errors,
@@ -1139,7 +1139,7 @@ class HarnessTests(unittest.TestCase):
         server = FixtureServer('oscillate')
         self.assertEqual(self.run_pipeline(server), 2)
         state = NovelExtractStorage.read_status(self.workspace)['review_state']
-        self.assertLessEqual(state['rounds'], 6)
+        self.assertLessEqual(state['rounds'], 8)
         self.assertFalse(state['accepted'])
         self.assertEqual(len(self.snapshots()['world']['events']), 2)
 
@@ -1758,6 +1758,152 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(self.run_pipeline(server, chunks=1), 0)
         self.assertEqual(server.saved_context['world']['events'][0]['time_node_id'], 'N1')
         self.assertTrue(any('事实修订未接收' in s for s in server.saved_context['last_delivery']['review']['program_feedback']))
+        receipt = server.saved_context['last_delivery']['review']['repair_receipt']
+        self.assertEqual(receipt['rejected']['event_updates'], ['EVT_UNKNOWN'])
+        self.assertEqual(receipt['accepted']['event_updates'], [])
+        self.assertFalse(receipt['current_references']['EVT_UNKNOWN']['exists'])
+        self.assertEqual(receipt['current_event_ids'], server.saved_context['required_event_ids'])
+
+    def test_partial_fact_rejection_receipt_reports_saved_subset(self):
+        class PartialFact(FixtureServer):
+            def reply(self, job, attempt, context):
+                result = super().reply(job, attempt, context)
+                if job == 'global.review.0':
+                    result['correction']['event_updates'] = {
+                        'EVT_C1_E1': {'description': '甲正式出发'},
+                        'EVT_UNKNOWN': {'description': '未知对象'}}
+                if job == 'global.review.1':
+                    self.saved_context = context
+                return result
+
+        server = PartialFact()
+        self.assertEqual(self.run_pipeline(server, chunks=1), 0)
+        self.assertEqual(server.saved_context['world']['events'][0]['description'], '甲正式出发')
+        receipt = server.saved_context['last_delivery']['review']['repair_receipt']
+        self.assertEqual(receipt['accepted']['event_updates'], ['EVT_C1_E1'])
+        self.assertEqual(receipt['rejected']['event_updates'], ['EVT_UNKNOWN'])
+        self.assertEqual(receipt['saved_event_delta']['changed'], ['EVT_C1_E1'])
+
+    def test_exhausted_format_repair_returns_specific_feedback_to_review(self):
+        class BadDelivery(FixtureServer):
+            def reply(self, job, attempt, context):
+                if job == 'global.review.0':
+                    return {'correction': {'event_updates': {'EVT_UNKNOWN': {}}}}
+                if job == 'global.review.1':
+                    self.saved_context = context
+                return super().reply(job, attempt, context)
+
+        server = BadDelivery()
+        self.assertEqual(self.run_pipeline(server, chunks=1), 0)
+        feedback = server.saved_context['last_delivery']['review']['program_feedback']
+        self.assertTrue(any('交付未通过程序校验：' in item for item in feedback))
+        self.assertTrue(server.saved_context['source_chunks'])
+
+    def test_rejected_deletion_receipt_preserves_current_references(self):
+        old = world([event(1), event(2)])
+        old.relations = [Relation(source='EVT_C1_E1', target='EVT_C2_E1',
+                                  kind='before', basis='原文先后')]
+        old.changes = [Change(event_id='EVT_C1_E1', subject_id='ENT_1',
+                              change='已出发', basis='原文')]
+        submitted = Review(is_valid=False, summary='删除旧记录', issues=[], covered_chunks=[1],
+                           correction=Correction(removals=[EventRemoval(
+                               id='EVT_C1_E1', reason='拟删除重复记录',
+                               signature=old.events[0].occurrence_signature)]))
+        receipt = NovelExtractWorkflow.repair_receipt(
+            submitted, Review(is_valid=False, summary='拒收', issues=[], covered_chunks=[1]), old, old)
+        self.assertEqual(receipt['rejected']['removals'], ['EVT_C1_E1'])
+        self.assertTrue(receipt['current_references']['EVT_C1_E1']['exists'])
+        self.assertEqual(len(receipt['current_references']['EVT_C1_E1']['relations']), 1)
+        self.assertEqual(len(receipt['current_references']['EVT_C1_E1']['changes']), 1)
+
+    def test_final_rejected_fact_gets_bounded_repair_and_review(self):
+        class LateRepair(FixtureServer):
+            def reply(self, job, attempt, context):
+                result = super().reply(job, attempt, context)
+                if job.startswith('global.review.'):
+                    index = int(job.rsplit('.', 1)[-1])
+                    if index < 6:
+                        result['is_valid'] = False
+                        result['issues'] = ['继续核对']
+                        result['correction']['world_traits'] = {f'WORLD_{index}': f'事实{index}'}
+                    elif index == 6:
+                        result['correction']['event_updates'] = {'EVT_UNKNOWN': {'description': '未知对象'}}
+                    elif index == 7:
+                        receipt = context['last_delivery']['review']['repair_receipt']
+                        self.assert_receipt = receipt
+                        result['correction']['event_updates'] = {'EVT_C1_E1': {'description': '甲正式出发'}}
+                return result
+
+        server = LateRepair()
+        original_set, interrupted = NovelExtractStorage.set, []
+        def stop_after_rejection(storage, key, value):
+            original_set(storage, key, value)
+            if key == 'review_state' and value['rounds'] == 8 and not interrupted:
+                interrupted.append(True)
+                raise KeyboardInterrupt()
+        self.assertEqual(self.run_pipeline(server, chunks=1, hook=patch.object(
+            NovelExtractStorage, 'set', stop_after_rejection)), 130)
+        self.assertEqual(self.run_pipeline(server, chunks=1), 0)
+        self.assertEqual(server.assert_receipt['rejected']['event_updates'], ['EVT_UNKNOWN'])
+        jobs = [job for job, _, _ in server.requests if job.startswith('global.')]
+        self.assertEqual(jobs[-3:], ['global.review.6', 'global.review.7', 'global.review.8'])
+        self.assertEqual(jobs.count('global.review.6'), 1)
+        self.assertEqual(self.snapshots()['world']['events'][0]['description'], '甲正式出发')
+        self.assertTrue(NovelExtractStorage.read_status(self.workspace)['review_state']['accepted'])
+        bounded = ReviewState(rounds=11, history=[{'round': 8, 'final_repair_handoff': True}])
+        self.assertFalse(NovelExtractWorkflow._review_round_available(bounded, 8))
+
+    def test_eighth_round_fact_revision_gets_one_necessary_review(self):
+        class FinalRevision(FixtureServer):
+            def reply(self, job, attempt, context):
+                result = super().reply(job, attempt, context)
+                if job.startswith('global.review.'):
+                    index = int(job.rsplit('.', 1)[-1])
+                    if index < 6:
+                        result['is_valid'] = False
+                        result['issues'] = ['继续核对']
+                        result['correction']['world_traits'] = {f'WORLD_{index}': f'事实{index}'}
+                    elif index == 6:
+                        result['correction']['event_updates'] = {
+                            'EVT_C1_E1': {'description': '甲正式出发'}}
+                return result
+
+        server = FinalRevision()
+        self.assertEqual(self.run_pipeline(server, chunks=1), 0)
+        state = NovelExtractStorage.read_status(self.workspace)['review_state']
+        self.assertEqual(state['rounds'], 9)
+        self.assertEqual([row['task'] for row in state['history'][-2:]], ['review', 'review'])
+        self.assertEqual(state['history'][-2]['final_confirmation_handoff'], 1)
+        self.assertTrue(state['accepted'])
+
+    def test_eighth_round_time_plan_gets_one_necessary_review(self):
+        class FinalTimeline(FixtureServer):
+            def reply(self, job, attempt, context):
+                result = super().reply(job, attempt, context)
+                if job.startswith('global.review.'):
+                    index = int(job.rsplit('.', 1)[-1])
+                    if index < 5:
+                        result['is_valid'] = False
+                        result['issues'] = ['继续核对']
+                        result['correction']['world_traits'] = {f'WORLD_{index}': f'事实{index}'}
+                    elif index == 5:
+                        result['correction']['event_updates'] = {
+                            'EVT_C1_E1': {'description': '甲正式出发'}}
+                        result['time'] = None
+                return result
+
+        server = FinalTimeline()
+        self.assertEqual(self.run_pipeline(server, chunks=1), 0)
+        state = NovelExtractStorage.read_status(self.workspace)['review_state']
+        self.assertEqual(state['rounds'], 9)
+        self.assertEqual([row['task'] for row in state['history'][-2:]], ['timeline', 'review'])
+        self.assertEqual(state['history'][-2]['final_confirmation_handoff'], 1)
+        self.assertTrue(state['accepted'])
+        self.assertFalse(NovelExtractWorkflow._review_round_available(ReviewState(rounds=8), 8))
+        handoff = ReviewState(rounds=9, history=[{'round': 8, 'final_confirmation_handoff': 2}])
+        self.assertTrue(NovelExtractWorkflow._review_round_available(handoff, 8))
+        handoff.rounds = 10
+        self.assertFalse(NovelExtractWorkflow._review_round_available(handoff, 8))
 
     def test_invalid_time_does_not_discard_valid_fact_patch(self):
         class InvalidTime(FixtureServer):
@@ -2267,11 +2413,11 @@ class HarnessTests(unittest.TestCase):
                 result = super().reply(job, attempt, context)
                 if job.startswith('global.review.'):
                     index = int(job.rsplit('.', 1)[-1])
-                    if index < 4:
+                    if index < 6:
                         result['is_valid'] = False
                         result['issues'] = ['继续核对']
                         result['correction']['world_traits'] = {f'WORLD_{index}': f'事实{index}'}
-                    elif index == 4:
+                    elif index == 6:
                         result['correction']['events'] = [event(
                             1, id='EVT_C1_LATE', description='甲到达',
                             occurrence_signature={**occurrence_signature(1), 'occurrence': '甲到达'},
@@ -2284,15 +2430,15 @@ class HarnessTests(unittest.TestCase):
         original_set, interrupted = NovelExtractStorage.set, []
         def stop_after_last_regular_round(storage, key, value):
             original_set(storage, key, value)
-            if key == 'review_state' and value['rounds'] == 6 and not interrupted:
+            if key == 'review_state' and value['rounds'] == 8 and not interrupted:
                 interrupted.append(True)
                 raise KeyboardInterrupt()
         self.assertEqual(self.run_pipeline(server, chunks=1, hook=patch.object(
             NovelExtractStorage, 'set', stop_after_last_regular_round)), 130)
         self.assertEqual(self.run_pipeline(server, chunks=1), 0)
         jobs = [job for job, _, _ in server.requests if job.startswith('global.')]
-        self.assertEqual(jobs[-3:], ['global.review.4', 'global.timeline.1', 'global.review.5'])
-        self.assertEqual(jobs.count('global.review.4'), 1)
+        self.assertEqual(jobs[-3:], ['global.review.6', 'global.timeline.1', 'global.review.7'])
+        self.assertEqual(jobs.count('global.review.6'), 1)
         saved = {item['id']: item for item in self.snapshots()['world']['events']}
         self.assertIsNotNone(saved['EVT_C1_LATE']['time_node_id'])
         self.assertEqual(saved['EVT_C1_E1']['description'], '甲出发')
@@ -2304,11 +2450,11 @@ class HarnessTests(unittest.TestCase):
                 result = super().reply(job, attempt, context)
                 if job.startswith('global.review.'):
                     index = int(job.rsplit('.', 1)[-1])
-                    if index < 3:
+                    if index < 5:
                         result['is_valid'] = False
                         result['issues'] = ['继续核对']
                         result['correction']['world_traits'] = {f'WORLD_{index}': f'事实{index}'}
-                    elif index == 3:
+                    elif index == 5:
                         result['correction']['events'] = [event(
                             1, id='EVT_C1_LATE', description='甲到达',
                             occurrence_signature={**occurrence_signature(1), 'occurrence': '甲到达'},
@@ -2318,7 +2464,7 @@ class HarnessTests(unittest.TestCase):
         server = PenultimateFacts()
         self.assertEqual(self.run_pipeline(server, chunks=1), 0)
         jobs = [job for job, _, _ in server.requests if job.startswith('global.')]
-        self.assertEqual(jobs[-3:], ['global.review.3', 'global.timeline.1', 'global.review.4'])
+        self.assertEqual(jobs[-3:], ['global.review.5', 'global.timeline.1', 'global.review.6'])
         saved = {item['id']: item for item in self.snapshots()['world']['events']}
         self.assertIsNotNone(saved['EVT_C1_LATE']['time_node_id'])
         self.assertTrue(NovelExtractStorage.read_status(self.workspace)['review_state']['accepted'])

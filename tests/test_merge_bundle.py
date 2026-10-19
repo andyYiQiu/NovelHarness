@@ -151,7 +151,7 @@ class MergeBundleTests(unittest.TestCase):
         class FinalStorage(Storage):
             @staticmethod
             def get(key, default=None):
-                return {'rounds': 5} if key == 'review_state' else default
+                return {'rounds': 7} if key == 'review_state' else default
 
         final_workflow = NovelExtractWorkflow()
         final_workflow.storage, final_workflow.failures = FinalStorage(), []

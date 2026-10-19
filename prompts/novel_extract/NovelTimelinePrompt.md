@@ -6,5 +6,6 @@
 不要求精确日期；实际遇害早于后来获知/讲述，申请早于实际完成。即使全文先写晚年归乡、后回忆少年出走和成年成家，节点仍排为出走→成家→归乡。不按文本位置、块号、事件编号或旧数字排序。
 交付time={nodes:[{id,name,relative,events:[{id,order,basis}]}]}，全部required_event_ids恰好一次，不另交节点order或平面timeline。relative说明阶段与相邻比较，basis说明开始锚点和组内比较，summary概括实际因果阶段链。
 不凭空补事件、不删困难事件。缺少精确日期时仍依据人生阶段、因果前提和相对词交付最有原文依据的完整分组与顺序；真正有歧义的比较在issues写明依据限制，交后续检查复核，不能用time=null整体放弃时间线。
+若 last_review_repair 不为空，只按当前 world 和 required_event_ids 排时；其中被拒的删除或改写没有生效，不得预先当作事实。
 current_time_groups是旧草稿，current_diagnostics是当前结构问题；它们都不是时间真值。响应仍交完整time，但只改变有具体冲突或缺失order的位置，其他节点和成员原样保留。
 原文明示的关键跨组先后用relations记录。发现旧关系冲突时先核对原文，再改位置或用relation_removals准确删错边；不为保留数字删正确因果。完整时间草稿随后接受一次广义语义审计；只有具体冲突才返工。

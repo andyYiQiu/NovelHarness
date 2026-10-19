@@ -1,6 +1,7 @@
 """小说提取工作流：入口、固定阶段依赖、跨块核实、时间确认及原子收尾。"""
 import argparse
 import asyncio
+from collections import Counter
 from copy import deepcopy
 from hashlib import sha256
 from importlib.metadata import version
@@ -24,6 +25,8 @@ from common.novel_extract.NovelExtractRevision import (
     apply_correction, apply_foundation_review, apply_information, apply_timeline,
     merge_bundle_errors, merge_bundle_gaps,
 )
+
+DEFAULT_REVIEW_ROUNDS = 8
 
 
 class ReviewState(BaseModel):
@@ -117,7 +120,8 @@ class NovelExtractWorkflow:
                     for index, left in enumerate(paths) for right in paths[index + 1:]), '输出、日志与工作区路径不能重叠')
         require(all(path != source_path and path not in source_path.parents for path in paths), '产物路径不能覆盖输入')
         policy = {'config': config, 'concurrency': args.concurrency, 'chunk_min_chars': 800, 'chunk_max_chars': 1200,
-                  'context_tail_chars': 300, 'output_repairs': 5, 'validation_repairs': 2, 'review_rounds': 6,
+                  'context_tail_chars': 300, 'output_repairs': 5, 'validation_repairs': 2,
+                  'review_rounds': DEFAULT_REVIEW_ROUNDS,
                   'max_calls': min(args.max_steps, config['max_calls']), 'max_request_chars': args.max_request_chars}
         identity = {'format': NovelExtractStorage.FORMAT_VERSION, 'source': source_path.stem,
                     'source_sha256': sha256(text.encode('utf-8')).hexdigest(), 'fingerprint': fingerprint(),
@@ -591,7 +595,7 @@ class NovelExtractWorkflow:
                             ('id', 'source_time', 'time_node_id', 'event_order', 'temporal_basis')}
                            for event in topology.get('events', []) if isinstance(event, dict)],
             })
-        return compact_evidence({
+        context = {
             'responsibility': 'timeline', 'source_chunks': full_source_context(chunks), 'world': data,
             'story_overview': saved_information.get('story_overview'),
             'story_spine': saved_information.get('story_spine'),
@@ -599,7 +603,11 @@ class NovelExtractWorkflow:
             'required_event_ids': [e.id for e in world.events], 'current_time_groups': groups,
             'current_diagnostics': timeline_errors(world) + temporal_errors(world),
             'last_delivery': state.feedback.get('timeline', {}),
-        }, chunks)
+        }
+        receipt = state.feedback.get('review', {}).get('repair_receipt')
+        if receipt:
+            context['last_review_repair'] = receipt
+        return compact_evidence(context, chunks)
 
     @staticmethod
     def time_groups(world):
@@ -910,7 +918,7 @@ class NovelExtractWorkflow:
             elif (not submitted_merges and review.correction == Correction()
                   and patch.event_updates
                   and self.storage.get('review_state', {}).get('rounds', 0) + 1
-                  < getattr(self, 'review_rounds', 6)):
+                  < getattr(self, 'review_rounds', DEFAULT_REVIEW_ROUNDS)):
                 candidate, accepted, rejected = self.preserve_event_bundles(
                     review, world, chunks, pending, patch)
                 errors.extend('独立事实修订未接收：' + item for item in rejected)
@@ -1035,12 +1043,76 @@ class NovelExtractWorkflow:
 
     @staticmethod
     def _review_round_available(state, review_rounds):
-        normal = state.rounds < review_rounds
-        handoff_round = next((item['round'] for item in reversed(state.history)
-                              if item.get('final_time_handoff')), None)
-        final_handoff = (handoff_round is not None
-                         and state.rounds < handoff_round + 2)
-        return normal or final_handoff
+        limit = review_rounds
+        for item in state.history:
+            extra = max(3 if item.get('final_repair_handoff') else 0,
+                        2 if item.get('final_time_handoff') else 0,
+                        item.get('final_confirmation_handoff', 0))
+            if extra:
+                limit = max(limit, item['round'] + extra)
+        return state.rounds < limit
+
+    @staticmethod
+    def repair_receipt(submitted, applied, before, after):
+        """把本轮实际接收的修订与仍需处理的引用交回检查角色。"""
+        def actions(patch):
+            return {
+                'entities': sorted(patch.entities),
+                'locations': sorted(patch.locations),
+                'objects': sorted(patch.objects),
+                'world_traits': sorted(patch.world_traits),
+                'entity_merges': sorted(f'{row.source}→{row.target}' for row in patch.entity_merges),
+                'location_merges': sorted(f'{row.source}→{row.target}' for row in patch.location_merges),
+                'object_merges': sorted(f'{row.source}→{row.target}' for row in patch.object_merges),
+                'events': sorted(row.id for row in patch.events),
+                'event_updates': sorted(patch.event_updates),
+                'merges': sorted(f'{row.source}→{row.target}' for row in patch.merges),
+                'removals': sorted(row.id for row in patch.removals),
+                'relations': sorted(f'{row.source}→{row.target}/{row.kind}'
+                                    for row in patch.relations or []),
+                'relation_removals': sorted(f'{row.source}→{row.target}/{row.kind}'
+                                            for row in patch.relation_removals),
+                'changes': sorted(f'{row.event_id}/{row.subject_id}/{row.change}'
+                                  for row in patch.changes or []),
+                'change_removals': sorted(f'{row.event_id}/{row.subject_id}/{row.change}'
+                                          for row in patch.change_removals),
+            }
+
+        attempted = {key: value for key, value in actions(submitted.correction).items() if value}
+        saved_actions = actions(applied.correction)
+        saved = {key: saved_actions[key] for key in attempted}
+        rejected = {key: sorted((Counter(value) - Counter(saved[key])).elements())
+                    for key, value in attempted.items()}
+        current = {event.id: event for event in after.events}
+        affected = set(rejected.get('event_updates', []) + rejected.get('removals', []))
+        affected.update(key.split('→', 1)[0] for key in rejected.get('merges', []))
+        affected.update(key.split('→', 1)[0] for field in ('relations', 'relation_removals')
+                        for key in rejected.get(field, []))
+        affected.update(key.split('/', 1)[0] for field in ('changes', 'change_removals')
+                        for key in rejected.get(field, []))
+        references = {key: {
+            'exists': key in current,
+            'actor_ids': current[key].actor_ids if key in current else [],
+            'occurrence_signature': (current[key].occurrence_signature.model_dump(mode='json')
+                                     if key in current and current[key].occurrence_signature else None),
+            'relations': [row.model_dump(mode='json') for row in after.relations
+                          if key in (row.source, row.target)],
+            'changes': [row.model_dump(mode='json') for row in after.changes if row.event_id == key],
+        } for key in sorted(affected)}
+        old, new = {row.id: row for row in before.events}, current
+        return {
+            'submitted': attempted, 'accepted': saved, 'rejected': rejected,
+            'time': {'submitted': submitted.time is not None, 'accepted': applied.time is not None},
+            'information': {'submitted': submitted.information is not None,
+                            'accepted': applied.information is not None},
+            'saved_event_delta': {
+                'added': sorted(new.keys() - old.keys()),
+                'removed': sorted(old.keys() - new.keys()),
+                'changed': sorted(key for key in old.keys() & new.keys()
+                                  if old[key] != new[key]),
+            },
+            'current_event_ids': sorted(new), 'current_references': references,
+        }
 
     async def _request_global_delivery(self, task, job, chunks, world, state):
         """执行一轮时间或检查请求；失败候选仍按原协议保留供评估。"""
@@ -1062,6 +1134,7 @@ class NovelExtractWorkflow:
             raise
         except JobFailed as exc:
             self.log.write('error', job=job, error=str(exc))
+            saved = {}
             try:
                 saved = self.storage.latest('job:' + job, {})
                 submitted = saved.get('submitted_candidate', saved.get('candidate', {}))
@@ -1072,7 +1145,11 @@ class NovelExtractWorkflow:
                         *delivery.issues,
                         '交付未通过程序校验：' + str(saved.get('error') or exc)]))
             except ValueError:
-                delivery = None
+                delivery = (Review(is_valid=False, summary='检查任务未完整交付',
+                                   issues=['交付未通过程序校验：' + str(saved.get('error') or exc)],
+                                   covered_chunks=[])
+                            if task == 'review' and saved.get('submitted_candidate') is not None
+                            else None)
         return delivery, information
 
     def _evaluate_global_delivery(self, task, delivery, chunks, world, information):
@@ -1106,7 +1183,7 @@ class NovelExtractWorkflow:
         return review, candidate, details, model_issues
 
     def _advance_review_state(self, state, task, review, world, candidate, details,
-                              information, chunks, model_issues, review_rounds):
+                              information, chunks, model_issues, review_rounds, submitted=None):
         """推进一轮纯状态转换，返回仍未解决的任务及是否出现空转。"""
         changed = substantive_world(candidate) != substantive_world(world) or details != information
         self.update_time_confirmations(state, review, world, candidate, chunks)
@@ -1125,7 +1202,12 @@ class NovelExtractWorkflow:
         remaining = [failure for failure in self.failures
                      if failure['job'] not in review.resolved_jobs]
         state.accepted = ready and not remaining
-        program_feedback = [issue for issue in review.issues if issue not in model_issues]
+        program_feedback = [issue for issue in review.issues
+                            if issue not in model_issues or issue.startswith('交付未通过程序校验：')]
+        repair_needed = any(
+            ('修订未接收：' in issue and not issue.startswith('时间修订未接收：'))
+            or issue.startswith(('独立新增事件未接收：', '交付未通过程序校验：'))
+            for issue in program_feedback)
         signature = digest({
             'task': task,
             'world': substantive_world(candidate),
@@ -1140,22 +1222,33 @@ class NovelExtractWorkflow:
         state.signatures.append(signature)
         needs_time = (not state.time_reviewed
                       or any(issue.startswith('时间修订未接收：') for issue in program_feedback))
-        state.next_task = 'timeline' if task == 'review' and needs_time else 'review'
+        old_ids = {event.id for event in world.events}
+        new_unplaced = any(event.id not in old_ids
+                           and (event.time_node_id is None or event.event_order is None)
+                           for event in candidate.events)
+        state.next_task = ('timeline' if task == 'review' and needs_time
+                           and (new_unplaced or not repair_needed) else 'review')
         state.rounds += 1
         state.resolved_jobs = sorted(set(state.resolved_jobs) | set(review.resolved_jobs))
         state.feedback[task] = {'summary': review.summary, 'model_issues': model_issues,
                                 'program_feedback': program_feedback}
-        old_ids = {event.id for event in world.events}
+        if task == 'review' and submitted is not None and repair_needed:
+            state.feedback[task]['repair_receipt'] = self.repair_receipt(
+                submitted, review, world, candidate)
         final_time_handoff = (review_rounds - 1 <= state.rounds <= review_rounds
-                              and task == 'review'
-                              and any(event.id not in old_ids and
-                                      (event.time_node_id is None or event.event_order is None)
-                                      for event in candidate.events))
+                              and task == 'review' and new_unplaced)
+        final_repair_handoff = (review_rounds - 1 <= state.rounds <= review_rounds
+                                and task == 'review' and repair_needed
+                                and not any(item.get('final_repair_handoff') for item in state.history))
+        final_confirmation_handoff = (2 if state.next_task == 'timeline' else 1) if (
+            state.rounds == review_rounds and changed and not state.accepted) else 0
         state.history.append({
             'round': state.rounds, 'task': task, 'changed': changed,
             'issues': review.issues, 'summary': review.summary,
             'resolved_jobs': review.resolved_jobs,
             'final_time_handoff': final_time_handoff,
+            'final_repair_handoff': final_repair_handoff,
+            'final_confirmation_handoff': final_confirmation_handoff,
         })
         return remaining, repeated
 
@@ -1176,18 +1269,19 @@ class NovelExtractWorkflow:
         state = ReviewState.model_validate(self.storage.get('review_state', {}))
         if state.accepted:
             return world, True
-        review_rounds = getattr(self, 'review_rounds', 6)
+        review_rounds = getattr(self, 'review_rounds', DEFAULT_REVIEW_ROUNDS)
         while self._review_round_available(state, review_rounds):
             task = state.next_task if world.events else 'review'
             job = f'global.{task}.{sum(h["task"] == task for h in state.history)}'
             self.stage('跨块合并与时间校验', round=state.rounds + 1, responsibility=task)
             delivery, information = await self._request_global_delivery(
                 task, job, chunks, world, state)
+            submitted = delivery.model_copy(deep=True) if task == 'review' and delivery else None
             review, candidate, details, model_issues = self._evaluate_global_delivery(
                 task, delivery, chunks, world, information)
             remaining, repeated = self._advance_review_state(
                 state, task, review, world, candidate, details, information,
-                chunks, model_issues, review_rounds)
+                chunks, model_issues, review_rounds, submitted)
             self._save_review_round(job, state, review, candidate, details, remaining)
             world, self.failures = candidate, remaining
             if state.accepted:

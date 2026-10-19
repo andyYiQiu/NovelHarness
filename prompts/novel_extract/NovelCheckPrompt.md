@@ -6,3 +6,4 @@ second_pass_proposals 中 original_id 指向 world 里的原事件，proposed �
 独立核对完整时间线：逐节点判断故事世界的实际开始先后，再检查节点内事件先后。尤其比较回忆中的早年经历与叙述开头的晚年场景；不要因它先出现在文本里就排到前面。相同节点的事件可同时开始，不同节点必须有唯一先后。具体冲突写入 issues；事件集合不变时可在同轮用完整 time 分组修正，没有修改就交 time=null。
 
 用 correction 和 information 一次修正能确定的多处错误，只改受影响记录；相同 event_id 不可换成另一件事，event_updates 不写 time_node_id/event_order，时间位置只交 time。事件集合改变且无法保证 time 覆盖修订后全部编号时，先交 time=null，下一轮按实存事件重排。四项签名相同才用 merges，并在 event_updates 中列出保留事件、补入来源独有内容；签名不同但确认重复时，先核对原文、保全独有内容，再用带旧签名的 removals 删除多余事件并处理其引用，不改写旧签名强行合并。无法安全修正时保留旧事实，写明具体问题。issues 仅留修后未解决的重大问题；原文证据止于未知且已准确标记，不算错误。covered_chunks 填本轮确实读过的原文块编号；首轮应覆盖全部块。time_valid=true 只表示你已根据原文核对当前完整时间线且没有具体时间错误，不能凭现有 order 已填就确认。is_valid=true 只在重大问题已经解决且资料、核心事件、时间线均可交付时使用。
+若 last_delivery.review 有 program_feedback 和 repair_receipt，先按拒收原因及回执核对实际保存的操作、事件和引用；只重交被拒或仍有误的部分，不把上轮提交视为已保存。拒收后仍以本轮 world 为准判断事实与时间。
