@@ -11,5 +11,6 @@ reports/
 repository/
 novel_data/
 HANDOFF*.md
+PROJECT_HANDOFF.md
 model/config.formal*.json
 .pytest_cache/

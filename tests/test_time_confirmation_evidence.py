@@ -4,7 +4,7 @@ import unittest
 from common.novel_extract.NovelExtractReader import chunk_text
 from common.novel_extract.NovelExtractRuntime import digest
 from common.novel_extract.NovelExtractSchema import (
-    Entity, Event, Evidence, Review, TimeNode, World, time_dependencies,
+    Entity, Event, Evidence, Review, TimeNode, TimePlacement, Timeline, World, time_dependencies,
 )
 from workflows.NovelExtractWorkflow import NovelExtractWorkflow, ReviewState
 
@@ -66,6 +66,19 @@ class TimeConfirmationEvidenceTests(unittest.TestCase):
         self.assertNotIn('B', state.confirmed_times)
         self.workflow.update_time_confirmations(state, review, revised, revised, self.chunks)
         self.assertEqual(state.confirmed_times['B'], digest(time_dependencies(revised)['B']))
+
+    def test_rejected_time_plan_cannot_confirm_the_unchanged_draft(self):
+        review = Review(is_valid=True, time_valid=True, summary='按拟合并后的集合确认',
+                        issues=[], covered_chunks=[1], time=Timeline(complete=True,
+                            nodes=self.world.time_nodes, timeline=[
+                                TimePlacement(id='A', node_id='N1', order=1, basis='原文')]))
+        candidate, _, error = self.workflow._apply_review_time(
+            self.world, review, self.chunks, self.world.time_nodes)
+        self.assertIn('缺少事件', error)
+        self.assertEqual(candidate, self.world)
+        state = ReviewState()
+        self.workflow.update_time_confirmations(state, review, self.world, candidate, self.chunks)
+        self.assertFalse(state.confirmed_times)
 
     def test_explanation_rewording_does_not_revoke_time(self):
         state = ReviewState(confirmed_times={key: digest(value)

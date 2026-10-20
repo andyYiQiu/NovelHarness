@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field, ValidationError
 from common.novel_extract.NovelExtractRuntime import ROOT, JobFailed, RunStopped, digest, fingerprint, require, safe_path
 from storage.novel_extract.NovelExtractStorage import NovelExtractStorage
 from common.novel_extract.NovelExtractReader import chunk_text, compact_evidence, full_source_context
+from common.novel_extract.NovelExtractState import asset_errors, asset_references, initial_state_coverage, replay_states
 from common.novel_extract.NovelExtractSchema import (
     Consequences, Correction, EventPass, Foundation, FoundationReview, FoundationFullReview, InformationPatch, Reading, Register, Review,
     World, RepositoryInformation, Timeline, TimelinePlan, information_errors,
@@ -213,12 +214,12 @@ class NovelExtractWorkflow:
         self.log.write('error', **record)
 
     @staticmethod
-    def recover_foundation_fields(initial, submitted):
+    def recover_foundation_fields(initial, submitted, chunks=()):
         """保留失败核对中的有效修订；无效字段退回原值并保持待核状态。"""
         check = FoundationReview.model_validate(submitted)
         patch = deepcopy(check.information or {})
         try:
-            return check, apply_foundation_review(initial, check), []
+            return check, apply_foundation_review(initial, check, chunks), []
         except ValidationError as exc:
             rejected = []
             for issue in exc.errors():
@@ -233,7 +234,7 @@ class NovelExtractWorkflow:
                 changed.pop(field)
                 rejected.append('.'.join(map(str, path)))
             check.information = patch
-            return check, apply_foundation_review(initial, check), rejected
+            return check, apply_foundation_review(initial, check, chunks), rejected
 
     async def foundation(self, text):
         """一次建立全文目录及档案，再独立增量核对；已有效的目录不因档案缺项停用。"""
@@ -242,11 +243,16 @@ class NovelExtractWorkflow:
             return Register.model_validate(self.storage.latest('register'))
         self.stage('全文人物、地点、物品及世界背景提取')
         instructions = prompt('NovelInformationPrompt.md')
+        chunks = chunk_text(text)
+        source = '\n'.join(f'[{key}]\n{body}' for chunk in chunks for key, body in chunk.passages().items())
+        def validate_catalog(value):
+            normalize_evidence(value.catalog, chunks)
+            return register_errors(value.catalog) + evidence_errors(value.catalog, chunks)
         try:
             initial = await self.agent.run('foundation.extract', 'foundation_extractor', instructions,
-                {'responsibility': 'extract', 'novel_source': text,
+                {'responsibility': 'extract', 'novel_source': source,
                  'information_schema': RepositoryInformation.model_json_schema()}, Foundation,
-                lambda value: register_errors(value.catalog))
+                validate_catalog)
         except JobFailed as exc:
             self.failed('foundation.extract', exc)
             # 目录任务的模型交付失败不能变成整篇停工。空目录只是合法的
@@ -270,7 +276,13 @@ class NovelExtractWorkflow:
         needs_full_information = False
         try:
             details = RepositoryInformation.model_validate(initial.information)
+            normalize_evidence(details.initial_state, chunks)
+            initial.information = details.model_dump(mode='json')
             issues = information_errors(details, initial.catalog)
+            issues += asset_errors(World(**initial.catalog.model_dump()), initial.catalog, chunks,
+                                   details.initial_state, require_complete=True)
+            if self.storage.get('format', 37) >= 39:
+                issues += initial_state_coverage(details, initial.catalog)
         except ValueError as exc:
             issues = [str(exc)]
             needs_full_information = True
@@ -282,14 +294,15 @@ class NovelExtractWorkflow:
                 # 同一请求内只修复无法落库的交付结构。资料是否完整、准确以及
                 # audit 中主动报告的疑点，要在保存候选后作为语义结果处理；
                 # 否则紧凑格式修复既看不到原文，又会把正常发现的问题误当失败。
-                revised = apply_foundation_review(initial, check)
+                revised = apply_foundation_review(initial, check, chunks)
                 RepositoryInformation.model_validate(revised.information)
                 return []
             check = await self.agent.run('foundation.check', 'foundation_checker', instructions,
-                {'responsibility': 'check', 'novel_source': text, 'current': initial.model_dump(mode='json'),
+                {'responsibility': 'check', 'novel_source': source,
+                 'current': compact_evidence(initial.model_dump(mode='json'), chunks),
                  'structural_errors': issues, 'information_schema': RepositoryInformation.model_json_schema()},
                 FoundationFullReview if needs_full_information else FoundationReview, validate)
-            result = apply_foundation_review(initial, check)
+            result = apply_foundation_review(initial, check, chunks)
             if check.issues:
                 self.failed('foundation.check', '; '.join(check.issues))
         except RunStopped:
@@ -299,7 +312,7 @@ class NovelExtractWorkflow:
             submitted = self.storage.latest('job:foundation.check', {}).get('submitted_candidate')
             if submitted:
                 try:
-                    check, result, rejected_fields = self.recover_foundation_fields(initial, submitted)
+                    check, result, rejected_fields = self.recover_foundation_fields(initial, submitted, chunks)
                 except ValueError:
                     pass
         details = None
@@ -355,6 +368,7 @@ class NovelExtractWorkflow:
                         existing = {event.id: event for event in prior.events}
                         # 旧事件重发只作为核实建议，不让建议中的复抄错误阻断本轮新增事实。
                         normalize_evidence([e for e in value.events if e.id not in existing], chunks)
+                        normalize_evidence(value.objects, chunks)
                         errors = []
                         for field, namespace in (('entities', 'ENT'), ('locations', 'LOC'), ('objects', 'OBJ')):
                             for key, item in getattr(value, field).items():
@@ -399,10 +413,19 @@ class NovelExtractWorkflow:
                     topology = self.combine(topology, result)
                     self.storage.snapshot(prefix + '.topology', topology.model_dump(mode='json'))
                 job = prefix + '.consequences'
+                def validate_consequences(value):
+                    normalize_evidence(value, chunks)
+                    errors = []
+                    if self.storage.get('format', 37) >= 38:
+                        missing = {e.id for e in topology.events} - value.state_deltas.keys()
+                        if missing:
+                            errors.append(f'state_deltas缺少事件{sorted(missing)}；无变化也交空集合')
+                    combined = self.combine(topology, value)
+                    return errors + topology_errors(combined, combined, chunks, check_time=True)
                 result = await self.agent.run(job, 'consequences', instructions,
                     {**base, 'register': Register.model_validate(topology.model_dump()).model_dump(mode='json'),
                      'responsibility': 'consequences', 'current': topology.model_dump(mode='json')},
-                    Consequences, lambda value: topology_errors(self.combine(topology, value), topology, chunks, check_time=True))
+                    Consequences, validate_consequences)
                 topology = self.combine(topology, result)
                 self.storage.snapshot(prefix + '.topology', topology.model_dump(mode='json'))
             except RunStopped:
@@ -463,6 +486,10 @@ class NovelExtractWorkflow:
         if len({event.id for event in incoming}) != len(incoming):
             raise ValueError('同一提交中存在重复事件编号')
         events.update({event.id: event for event in incoming})
+        for key, delta in getattr(update, 'state_deltas', {}).items():
+            if key not in events:
+                raise ValueError(f'state_deltas.{key}: 未知事件编号')
+            events[key] = events[key].model_copy(deep=True, update={'state_delta': delta.model_copy(deep=True)})
         def distinct(rows):
             return list({digest(row.model_dump(mode='json')): row for row in rows}.values())
         nodes = {node.id: node for node in prior.time_nodes}
@@ -567,7 +594,7 @@ class NovelExtractWorkflow:
                      for proposal in self.storage.latest(f'chunk.{chunk.index}.proposals', [])]
         if proposals:
             context['second_pass_proposals'] = proposals
-        if not information:
+        if not information or information.get('initial_state') is None:
             context['information_schema'] = RepositoryInformation.model_json_schema()
         pending = self.pending_world()
         if any((pending.events, pending.entities, pending.locations, pending.objects)):
@@ -578,7 +605,7 @@ class NovelExtractWorkflow:
         """时间比较保留全文、实际事件和引用身份，去掉无关档案、后果与历轮长历史。"""
         data = world.model_dump(mode='json', exclude={'changes', 'world_traits'})
         for event in data['events']:
-            for field in ('goals', 'required_results', 'core_reason', 'time_node_id', 'event_order'):
+            for field in ('goals', 'required_results', 'core_reason', 'time_node_id', 'event_order', 'state_delta'):
                 event.pop(field, None)
         data.pop('time_nodes')
         # 局部节点不是全局分组模板。只有跨块安排过的草稿才作为待核对候选提供。
@@ -713,11 +740,14 @@ class NovelExtractWorkflow:
 
     @staticmethod
     def _event_catalog_references(event):
-        return {
+        references = {
             'entities': set(event.actor_ids) | set(event.target_ids),
             'locations': {event.at_location_id} if event.at_location_id else set(),
             'objects': set(event.object_ids),
         }
+        for field, keys in asset_references(event.state_delta).items():
+            references[field].update(keys)
+        return references
 
     @staticmethod
     def _submitted_ids(value):
@@ -748,6 +778,8 @@ class NovelExtractWorkflow:
                 'locations': cls._submitted_ids(fields.get('at_location_id')),
                 'objects': cls._submitted_ids(fields.get('object_ids')),
             }
+            for field, keys in asset_references(fields.get('state_delta')).items():
+                explicit[field].update(keys)
             if key in affected_events or any(explicit[field] & sources[field] for field in sources):
                 affected_events.add(key)
                 correction.event_updates.pop(key)
@@ -811,6 +843,13 @@ class NovelExtractWorkflow:
             if isinstance(information, dict):
                 information.pop('relations', None)
 
+        if isinstance(information, dict) and 'initial_state' in information:
+            for details in (current_information, information):
+                refs = asset_references(details.get('initial_state')) if isinstance(details, dict) else {}
+                if any(refs.get(field, set()) & sources[field] for field in sources):
+                    information.pop('initial_state', None)
+                    break
+
         cls._remove_merge_coupled_time(review, world, originals, affected_events)
         review.correction = correction
         review.information = information
@@ -826,8 +865,8 @@ class NovelExtractWorkflow:
         return errors
 
     @staticmethod
-    def merge_bundles(correction, require_profile=False):
-        """把合并转为统一隔离描述；档案失败只涉及人物和地点合并。"""
+    def merge_bundles(correction):
+        """把目录合并转为统一隔离描述；三类对象均可能被初始状态引用。"""
         return [
             (merge_field, catalog_field, profile_field, merge, [])
             for merge_field, catalog_field, profile_field in (
@@ -835,7 +874,6 @@ class NovelExtractWorkflow:
                 ('location_merges', 'locations', 'locations'),
                 ('object_merges', 'objects', None),
             )
-            if not require_profile or profile_field is not None
             for merge in getattr(correction, merge_field)
         ]
 
@@ -937,6 +975,7 @@ class NovelExtractWorkflow:
             candidate = apply_timeline(candidate, review.time, chunks, previous_nodes)
         except ValueError as exc:
             review.time = None
+            review.time_valid = False
             return candidate, submitted, str(exc)
         return candidate, submitted, None
 
@@ -945,11 +984,11 @@ class NovelExtractWorkflow:
         """接收档案；档案失败时回收与身份合并耦合的事实和时间。"""
         try:
             details = apply_information(
-                current_information, review, candidate, complete=False).model_dump(mode='json')
+                current_information, review, candidate, complete=False, chunks=chunks).model_dump(mode='json')
             return candidate, details, time_error
         except ValueError as exc:
             errors.append('档案修订未接收：' + str(exc))
-        profile_merges = self.merge_bundles(review.correction, require_profile=True)
+        profile_merges = self.merge_bundles(review.correction)
         if not profile_merges:
             review.information = None
             return candidate, current_information, time_error
@@ -962,12 +1001,10 @@ class NovelExtractWorkflow:
         except ValueError as isolated:
             errors.append('合并隔离后的独立事实修订未接收：' + str(isolated))
             candidate, review.correction = world.model_copy(deep=True), Correction()
-        if review.time is not None:
-            try:
-                candidate = apply_timeline(candidate, review.time, chunks, world.time_nodes)
-            except ValueError as isolated:
-                errors.append('合并隔离后的独立时间修订未接收：' + str(isolated))
-                review.time = None
+        candidate, _, isolated_time_error = self._apply_review_time(
+            candidate, review, chunks, world.time_nodes)
+        if isolated_time_error is not None:
+            errors.append('合并隔离后的独立时间修订未接收：' + isolated_time_error)
         return candidate, current_information, None
 
     @staticmethod
@@ -1023,6 +1060,18 @@ class NovelExtractWorkflow:
         if time_error is not None:
             errors.append('时间修订未接收：' + time_error)
         errors.extend(self._review_result_errors(review, candidate, details, chunks))
+        if self.storage.get('format', 37) >= 38:
+            try:
+                parsed = RepositoryInformation.model_validate(details) if details else None
+            except ValueError:
+                parsed = None  # 档案错误已报告；保留partial，不让诊断阶段异常中止。
+            initial = parsed.initial_state if parsed is not None else None
+            errors.extend(asset_errors(candidate, candidate, chunks, initial, require_complete=True))
+            if self.storage.get('format', 37) >= 39:
+                errors.extend(initial_state_coverage(parsed, candidate))
+            if initial is not None and not timeline_errors(candidate, require_complete=True):
+                _, state_errors = replay_states(candidate, initial)
+                errors.extend(state_errors)
         if errors:
             review.is_valid = False
             review.issues = list(dict.fromkeys([*review.issues, *errors]))
@@ -1098,6 +1147,8 @@ class NovelExtractWorkflow:
             'relations': [row.model_dump(mode='json') for row in after.relations
                           if key in (row.source, row.target)],
             'changes': [row.model_dump(mode='json') for row in after.changes if row.event_id == key],
+            'state_delta': (current[key].state_delta.model_dump(mode='json')
+                            if key in current and current[key].state_delta is not None else None),
         } for key in sorted(affected)}
         old, new = {row.id: row for row in before.events}, current
         return {

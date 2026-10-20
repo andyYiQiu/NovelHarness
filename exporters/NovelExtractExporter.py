@@ -11,7 +11,11 @@ import sys
 from tempfile import TemporaryDirectory
 
 from common.novel_extract.NovelExtractRuntime import digest, encode, require, safe_path
-from common.novel_extract.NovelExtractSchema import time_dependencies
+from common.novel_extract.NovelExtractSchema import AssetState, RepositoryInformation, time_dependencies
+from common.novel_extract.NovelExtractReader import Chunk
+from common.novel_extract.NovelExtractState import (
+    asset_errors, asset_references, initial_state_coverage, public_state, remap_assets, replay_states,
+)
 
 
 class NovelExtractExporter:
@@ -132,7 +136,10 @@ class NovelExtractExporter:
         node_details = {}
         for event in world.events:
             people = list(dict.fromkeys(event.actor_ids + event.target_ids))
-            missing = [key for key in people if key not in roles]
+            required_people = set(people)
+            if self.storage.get('format', 37) >= 38:
+                required_people.update(asset_references(event.state_delta)['entities'])
+            missing = sorted(required_people - roles.keys())
             reason = ('事件编号重复' if counts[event.id] > 1 else
                       '事件正文为空' if not event.description.strip() else
                       '事件时间节点未交付；保留在未完成清单，不制造占位节点' if event.time_node_id not in time_nodes else
@@ -167,7 +174,70 @@ class NovelExtractExporter:
                                    'exact_start': None, 'exact_end': None, 'duration': None},
                           'interval_from_previous': None, 'path': path})
         files['timeline/timeline.json'] = {'source': source, 'time_basis': 'story', 'nodes': nodes}
+        if self.storage.get('format', 37) >= 38:
+            self.project_dynamic_assets(world, information, roles, files, excluded, confirmed)
+        if self.storage.get('format', 37) >= 39:
+            files = public_state(files, include_evidence=False)
         return files, excluded
+
+    def project_dynamic_assets(self, world, information, roles, files, excluded, confirmed):
+        """格式38的物品档案、事件delta与节点入口快照；旧实验投影保持原样。"""
+        source = self.storage.get('source')
+        objects = {key: self.identifier(key) for key in world.objects}
+        require(len(set(objects.values())) == len(objects), '物品文件编号冲突')
+        redirects = {**roles, **objects}
+        for code in roles.values():
+            files[f'roles/{code}/role_info.json'].pop('relation', None)
+        for key, item in world.objects.items():
+            code = objects[key]
+            files[f'objects/{code}/object_info.json'] = {
+                'object_code': code, 'object_name': item.name, 'source': source,
+                'aliases': item.aliases, 'description': item.description or None,
+                'function': item.function, 'significance': item.significance,
+                'evidence': public_state(item)['evidence'],
+            }
+        events = {event.id: event for event in world.events}
+        exported_ids = set()
+        for path, content in files.items():
+            if path.startswith('timeline/') and path.endswith('/todolist.json'):
+                for task in content['todolist']:
+                    event = events[task['task_id']]
+                    exported_ids.add(event.id)
+                    task['object_ids'] = [objects[key] for key in event.object_ids]
+                    task['state_delta'] = (public_state(remap_assets(event.state_delta, redirects))
+                                           if event.state_delta is not None else None)
+        try:
+            details = RepositoryInformation.model_validate(information)
+            initial = details.initial_state
+            chunks = [Chunk(**row) for row in self.storage.latest('chunks', [])]
+            errors = asset_errors(world, world, chunks, initial, require_complete=True)
+            if self.storage.get('format', 37) >= 39:
+                errors.extend(initial_state_coverage(details, world))
+            missing_people = asset_references(initial)['entities'] - roles.keys()
+            if missing_people:
+                errors.append(f'初始状态引用的人物档案尚未导出：{sorted(missing_people)}')
+            if exported_ids != events.keys():
+                errors.append('部分事件未进入repository，不能发布依赖其delta的状态快照')
+            if errors:
+                snapshots = {}
+            else:
+                snapshots, errors = replay_states(world, initial, confirmed)
+        except ValueError as exc:
+            snapshots, errors = {}, [str(exc)]
+        excluded.extend({'kind': 'dynamic_state', 'reason': message} for message in errors)
+        snapshots = {self.identifier(key): value for key, value in snapshots.items()}
+        for node in files['timeline/timeline.json']['nodes']:
+            snapshot = snapshots.get(node['node_id'])
+            node['state_path'] = None
+            if snapshot is not None:
+                node['state_path'] = str(Path(node['path']).with_name('state_before.json'))
+                state = remap_assets(AssetState.model_validate(snapshot), redirects)
+                previous = snapshot['previous_node_id']
+                files['timeline/' + node['state_path']] = {
+                    'node_id': node['node_id'],
+                    'previous_node_id': self.identifier(previous) if previous else None,
+                    **public_state(state),
+                }
 
     def export(self, target, world):
         target = safe_path(target)
@@ -184,6 +254,8 @@ class NovelExtractExporter:
             stage = Path(temporary) / 'repository'
             for folder in ('roles', 'locations', 'worlds/background', 'worlds/settings', 'timeline'):
                 (stage / folder).mkdir(parents=True, exist_ok=True)
+            if self.storage.get('format', 37) >= 38:
+                (stage / 'objects').mkdir()
             for relative, value in files.items():
                 file = stage / relative
                 file.parent.mkdir(parents=True, exist_ok=True)

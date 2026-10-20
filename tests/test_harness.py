@@ -29,6 +29,7 @@ from workflows.NovelExtractWorkflow import NovelExtractWorkflow, ReviewState
 
 def event(index=1, **updates):
     data = dict(id=f'EVT_C{index}_E1', description='甲出发', actor_ids=['ENT_1'],
+                state_delta={'relations': [], 'objects': []},
                 core_reason='故事起点', temporal_basis='出发时', epistemic_status='事实',
                 occurrence_layer='实际发生',
                 evidence=[Evidence(chunk=index, passage_ids=[f'C{index}_P1'])])
@@ -47,6 +48,7 @@ def world(events):
 
 def information():
     return RepositoryInformation(
+        initial_state={'relations': [], 'objects': {}},
         story_overview='甲出发并推动了之后的行程',
         story_spine={
             'endings': ['甲已经出发'], 'turning_points': ['甲决定出发'],
@@ -223,7 +225,9 @@ class FixtureServer:
                     time_nodes=[TimeNode(id=f'TN_C{index}_1', name='出发阶段', order=1)],
                     coverage='已收录').model_dump(mode='json')
             if job.endswith('second_pass'): return EventPass(coverage='无新增').model_dump(mode='json')
-            return {'changes': [], 'coverage': '无其他状态变化'}
+            return {'changes': [], 'coverage': '无其他状态变化',
+                    'state_deltas': {row['id']: {'relations': [], 'objects': []}
+                                     for row in context['current']['events']}}
         round_index = int(job.split('.')[-1])
         if job.startswith('global.timeline.'):
             return TimelinePlan(summary='按实际开始归纳阶段', time=self.timeline(context['required_event_ids'])).model_dump(mode='json')
@@ -262,6 +266,13 @@ class FixtureServer:
                 'relation': ['原文中的相关人物'],
                 'detail': '两人在原文同一核心行程中发生直接关联',
             }]}
+            initial = deepcopy(context['information']['initial_state'])
+            initial['relations'].append({
+                'owner_id': current_entities[0], 'other_id': current_entities[1],
+                'relation': '原文中的相关人物', 'status': 'unknown', 'detail': '起点关系未说明',
+                'evidence': [{'chunk': 1, 'passage_ids': ['C1_P1']}],
+            })
+            information_patch['initial_state'] = initial
             audit = None
         # 事实修订会使本事件以及直接比较对端的时间依赖失效；
         # 它们必须留到下一轮独立确认，不能在修订同轮申明 confirmed。
@@ -336,10 +347,10 @@ class HarnessTests(unittest.TestCase):
         self.addCleanup(self.network.stop)
         self.addCleanup(self.temp.cleanup)
 
-    def run_pipeline(self, server, chunks=2, max_calls=1000, hook=None):
+    def run_pipeline(self, server, chunks=2, max_calls=1000, hook=None, text=None):
         source = self.directory / 'source.txt'
         if not source.exists():
-            source.write_text(('甲出发。\n\n' + '路旁有树。' * 190 + '\n\n') * chunks)
+            source.write_text(text if text is not None else ('甲出发。\n\n' + '路旁有树。' * 190 + '\n\n') * chunks)
             (self.directory / 'config.json').write_text(json.dumps({
                 'api_url': 'https://offline.invalid/v1/chat/completions', 'model': 'fixture',
                 'api_key_env': 'NOVEL_HARNESS_OFFLINE_KEY', 'timeout_seconds': 1,
@@ -634,7 +645,7 @@ class HarnessTests(unittest.TestCase):
             def reply(self, job, attempt, context):
                 result = super().reply(job, attempt, context)
                 if job == 'global.review.0' and attempt == 0:
-                    result['correction']['removals'] = [{'id': 'MISSING', 'reason': '错误删除编号'}]
+                    result['correction']['removals'] = [{'id': 'MISSING'}]
                 return result
         server = RepairPatch()
         result = self.run_pipeline(server, chunks=1)
@@ -643,7 +654,7 @@ class HarnessTests(unittest.TestCase):
                          [('global.timeline.0', 0), ('global.review.0', 0), ('global.review.0', 1)])
         followup = next(b['messages'][-1]['content'] for j, a, b in server.requests
                         if j == 'global.review.0' and a == 1)
-        self.assertIn('$.correction.removals[0].signature', followup)
+        self.assertIn('$.correction.removals[0].reason', followup)
         self.assertIn('补充协议要求的必填值', followup)
 
     @unittest.skip("Legacy proof-table protocol retired; see reports/novel_extract/shadowloom_validation_reset_20261016/retired_tests.md")
@@ -1452,7 +1463,7 @@ class HarnessTests(unittest.TestCase):
         chunks = chunk_text('甲出发。\n\n乙到达。')
         matching = event(evidence=[Evidence(chunk=1, passage_ids=['C1_P1'], quote='甲出发。')])
         normalize_evidence([matching], chunks)
-        self.assertEqual(matching.evidence, [Evidence(chunk=1, quote='甲出发。')])
+        self.assertEqual(matching.evidence, [Evidence(chunk=1, quote='甲出发。', passage_ids=['C1_P1'])])
         for quote in ('乙到达。', '甲出发。乙到达。', '甲没有出发。'):
             with self.subTest(quote=quote):
                 row = event(evidence=[Evidence(chunk=1, passage_ids=['C1_P1'], quote=quote)])
@@ -1571,7 +1582,9 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(value['records'][0]['evidence'][0]['quote'], '甲出发。')
         restored = [Event.model_validate(row) for row in compact['records']]
         normalize_evidence(restored, chunks)
-        self.assertEqual(restored[0].model_dump(mode='json'), value['records'][0])
+        expected = deepcopy(value['records'][0])
+        expected['evidence'][0]['passage_ids'] = ['C1_P1']
+        self.assertEqual(restored[0].model_dump(mode='json'), expected)
         repeated = chunk_text('甲出发。\n\n甲出发。')
         self.assertEqual(compact_evidence(value['records'], repeated), value['records'])
 
@@ -1799,6 +1812,37 @@ class HarnessTests(unittest.TestCase):
         self.assertTrue(any('交付未通过程序校验：' in item for item in feedback))
         self.assertTrue(server.saved_context['source_chunks'])
 
+    def test_truncated_review_keeps_actual_request_context_and_finishes(self):
+        class TruncatedReview(FixtureServer):
+            async def handle(self, request):
+                job, attempt = CALL_SCOPE.get()
+                if job == 'global.review.0' and attempt == 1:
+                    body = json.loads(request.content)
+                    # 直接检查实际请求；不能用FixtureServer缓存的旧上下文掩盖遗漏。
+                    self.retry_context = json.JSONDecoder().raw_decode(body['messages'][-1]['content'])[0]
+                response = await super().handle(request)
+                if job == 'global.review.0' and attempt == 0:
+                    payload = response.json()
+                    payload['choices'][0].update(finish_reason='length', message={'content': '{"is_valid":'})
+                    return httpx.Response(200, json=payload)
+                return response
+
+        server = TruncatedReview()
+        self.assertEqual(self.run_pipeline(server, chunks=1), 0)
+        self.assertTrue(server.retry_context['source_chunks'])
+        self.assertEqual(server.retry_context['world']['events'][0]['id'], 'EVT_C1_E1')
+        status = NovelExtractStorage.read_status(self.workspace)
+        self.assertEqual(status['status'], 'complete')
+        self.assertEqual(status['policy']['review_rounds'], 8)
+        self.assertTrue(status['review_state']['confirmed_times'])
+        jobs = [job for job, _, _ in server.requests]
+        self.assertEqual(jobs.count('foundation.extract'), 1)
+        self.assertEqual(jobs.count('global.timeline.0'), 1)
+        self.assertEqual(jobs.count('global.review.0'), 2)
+        requests = len(server.requests)
+        self.assertEqual(self.run_pipeline(server, chunks=1), 0)
+        self.assertEqual(len(server.requests), requests)
+
     def test_rejected_deletion_receipt_preserves_current_references(self):
         old = world([event(1), event(2)])
         old.relations = [Relation(source='EVT_C1_E1', target='EVT_C2_E1',
@@ -1815,6 +1859,44 @@ class HarnessTests(unittest.TestCase):
         self.assertTrue(receipt['current_references']['EVT_C1_E1']['exists'])
         self.assertEqual(len(receipt['current_references']['EVT_C1_E1']['relations']), 1)
         self.assertEqual(len(receipt['current_references']['EVT_C1_E1']['changes']), 1)
+
+    def test_merge_with_complete_time_survives_transaction_interruption(self):
+        class MergeAndTime(GroupedFixtureServer):
+            def reply(self, job, attempt, context):
+                result = super().reply(job, attempt, context)
+                if job == 'chunk.2.first_pass':
+                    result['events'][0]['occurrence_signature'] = occurrence_signature(1)
+                if job == 'global.review.0':
+                    target = next(e for e in context['world']['events'] if e['id'] == 'EVT_C2_E1')
+                    result['correction'] = {'events': [target], 'merges': [{
+                        'source': 'EVT_C1_E1', 'target': 'EVT_C2_E1', 'reason': '同一次出发重复记录'}]}
+                    result['time'] = {'nodes': [{
+                        'id': 'N1', 'name': '出发', 'relative': '同一次出发',
+                        'events': [{'id': 'EVT_C2_E1', 'order': 1, 'basis': '同一原文发生'}]}]}
+                return result
+
+        server = MergeAndTime()
+        original_set, interrupted = NovelExtractStorage.set, []
+        def stop_after_merge(storage, key, value):
+            original_set(storage, key, value)
+            if key == 'review_state' and value['rounds'] == 2 and not interrupted:
+                interrupted.append(True)
+                raise KeyboardInterrupt()
+        self.assertEqual(self.run_pipeline(server, chunks=2, hook=patch.object(
+            NovelExtractStorage, 'set', stop_after_merge)), 130)
+        self.assertEqual(len(self.snapshots()['world']['events']), 2)
+        self.assertEqual(self.run_pipeline(server, chunks=2), 0)
+        saved = self.snapshots()['world']
+        self.assertEqual([(e['id'], e['time_node_id']) for e in saved['events']], [('EVT_C2_E1', 'N1')])
+        state = NovelExtractStorage.read_status(self.workspace)['review_state']
+        self.assertEqual(set(state['confirmed_times']), {'EVT_C2_E1'})
+        jobs = [job for job, _, _ in server.requests]
+        self.assertEqual(jobs.count('global.review.0'), 1)
+        self.assertEqual(jobs.count('global.timeline.0'), 1)
+        self.assertEqual(jobs.count('global.review.1'), 1)
+        count = len(jobs)
+        self.assertEqual(self.run_pipeline(server, chunks=2), 0)
+        self.assertEqual(len(server.requests), count)
 
     def test_final_rejected_fact_gets_bounded_repair_and_review(self):
         class LateRepair(FixtureServer):
@@ -2356,7 +2438,9 @@ class HarnessTests(unittest.TestCase):
         self.assertFalse(any(job.startswith('ontology.') for job in jobs))
         for _, _, request in server.requests[:2]:
             context = json.loads(request['messages'][-1]['content'])
-            self.assertEqual(context['novel_source'], (self.directory / 'source.txt').read_text())
+            chunks = chunk_text((self.directory / 'source.txt').read_text())
+            expected = '\n'.join(f'[{key}]\n{body}' for chunk in chunks for key, body in chunk.passages().items())
+            self.assertEqual(context['novel_source'], expected)
         self.assertEqual(self.snapshots()['information'], information().model_dump(mode='json'))
 
     def test_second_pass_same_occurrence_is_a_review_proposal(self):
@@ -2506,6 +2590,11 @@ class HarnessTests(unittest.TestCase):
                                 'relation': ['同行程人物'],
                                 'detail': '甲与乙在原文中共同参与出发行程',
                             }],
+                            'initial_state': {'objects': {}, 'relations': [{
+                                'owner_id': 'ENT_1', 'other_id': 'ENT_2', 'relation': '同行程人物',
+                                'status': 'unknown', 'detail': '原文未说明出发前的关系',
+                                'evidence': [{'chunk': 1, 'passage_ids': ['C1_P1']}],
+                            }]},
                         },
                         'audit': information_audit(('ENT_1', 'ENT_2'), ('LOC_1',))}
                 return super().reply(job, attempt, context)

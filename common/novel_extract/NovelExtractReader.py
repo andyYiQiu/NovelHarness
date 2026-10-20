@@ -43,7 +43,7 @@ def compact_evidence(value, chunks):
             return item
         if isinstance(item.get('quote'), str) and isinstance(item.get('chunk'), int):
             key = references.get((item['chunk'], item['quote'].strip()))
-            if key and not item.get('passage_ids'):
+            if key and item.get('passage_ids') in (None, [], [key]):
                 return {**item, 'quote': '', 'passage_ids': [key]}
         return {key: visit(row) for key, row in item.items()}
     return visit(value)

@@ -2,6 +2,7 @@
 from copy import deepcopy
 
 from common.novel_extract.NovelExtractRuntime import DeliveryStructureError
+from common.novel_extract.NovelExtractState import merge_deltas, remap_assets
 from common.novel_extract.NovelExtractSchema import (
     CharacterInformation, Correction, Entity, Event, Foundation, Location,
     LocationInformation, Object, Register, RepositoryInformation, Review,
@@ -100,6 +101,7 @@ def _event_merge_plan(value, patch, events, updates, renames):
         raise ValueError('合并或删除编号重复')
     if set(mapping) & (set(mapping.values()) | removals | set(updates)) or removals & set(updates):
         raise ValueError('合并链、同轮合并并改写来源或删除并更新存在歧义')
+    time_repair = False
     for source, target in mapping.items():
         if source not in events or target not in events or target not in updates or source == target:
             raise ValueError('合并须引用两个已有事件，并完整提交保留事件：' + source)
@@ -115,22 +117,28 @@ def _event_merge_plan(value, patch, events, updates, renames):
         comparison = compare_starts(
             source_event, target_event, {node.id: node for node in value.time_nodes})
         if comparison not in (None, 0):
-            raise ValueError(f'事件合并 {source}→{target} 位于不同实际开始位置；不能合并')
+            time_repair = True
         evidence = [*updates[target].evidence, *events[source].evidence, *events[target].evidence]
         updates[target].evidence = list({
             (item.chunk, item.quote, tuple(item.passage_ids)): item for item in evidence
         }.values())
+        explicit_delta = ('state_delta' in patch.event_updates.get(target, {})
+                          or any(row.id == target and row.state_delta is not None for row in patch.events))
+        target_delta = target_event.state_delta or events[target].state_delta
+        if not explicit_delta and (source_event.state_delta is not None or target_delta is not None):
+            updates[target].state_delta = merge_deltas([source_event.state_delta, target_delta])
     if not removals <= events.keys():
         raise ValueError('删除引用了不存在的事件')
     removal_rows = {row.id: row for row in patch.removals}
     for key in removals:
         removal, event = removal_rows[key], events[key]
-        removal_signature = _revised_signature(removal.signature, value, renames)
         event_signature = _revised_signature(event.occurrence_signature, value, renames)
-        if (removal_signature.layer == '未分类' or event_signature is None
+        removal_signature = (_revised_signature(removal.signature, value, renames)
+                             if removal.signature is not None else event_signature)
+        if (event_signature is None or event_signature.layer == '未分类'
                 or removal_signature != event_signature):
             raise ValueError(f'事件删除 {key} 的发生签名与已保存事件不一致；不能删除')
-    return mapping, removals
+    return mapping, removals, time_repair
 
 
 def _commit_event_updates(events, updates, mapping, removals):
@@ -157,7 +165,8 @@ def update_records(current, updates, removals, fields, references):
     rows = {key(row): deepcopy(row) for row in current}
     incoming = {key(row): deepcopy(row) for row in updates or []}
     removed = {key(row) for row in removals}
-    if len(incoming) != len(updates or []) or len(removed) != len(removals):
+    # 同一目标重复删除只有一种结果；重复更新可能冲突，仍拒绝。
+    if len(incoming) != len(updates or []):
         raise ValueError('关系/状态变化存在重复修改编号')
     errors = []
     for identity in sorted(removed - rows.keys()):
@@ -182,6 +191,7 @@ def _remap_graph(value, patch, events, renames, mapping, removals):
     """在目录/事件合并后统一重写图引用，并移除已经没有事件的节点。"""
     value.events = list(events.values())
     for event in value.events:
+        event.state_delta = remap_assets(event.state_delta, renames)
         for field in ('actor_ids', 'target_ids', 'object_ids'):
             setattr(event, field, list(dict.fromkeys(
                 renames.get(key, key) for key in getattr(event, field))))
@@ -228,10 +238,20 @@ def apply_correction(world, review, chunks=(), pending=None):
     patch = review.correction
     pending = pending or World(entities={}, locations={}, objects={}, world_traits={})
     renames = _apply_catalog_correction(value, patch)
+    if chunks:
+        normalize_evidence(list(value.objects.values()), chunks)
     events, updates = _collect_event_updates(value, review, pending, chunks, renames)
-    mapping, removals = _event_merge_plan(value, patch, events, updates, renames)
+    mapping, removals, time_repair = _event_merge_plan(value, patch, events, updates, renames)
+    if time_repair and (review.time is None or not review.time.complete):
+        raise ValueError('事件合并位于不同实际开始位置；须同轮提交合并后的完整time，合并与排时一起核验')
     events = _commit_event_updates(events, updates, mapping, removals)
     _remap_graph(value, patch, events, renames, mapping, removals)
+    if time_repair:
+        # 旧位置可被纠正，但不能先删除事件、再保存一个未通过检查的时间方案。
+        value = apply_timeline(value, review.time, chunks, world.time_nodes)
+        errors = timeline_errors(value, require_complete=True)
+        if errors:
+            raise ValueError('\n'.join(errors))
     return value
 
 
@@ -291,7 +311,7 @@ def merge_bundle_gaps(correction, information):
                 missing.append(f'$.correction.{catalog_field}.{merge.target}')
             else:
                 catalog_path = f'$.correction.{catalog_field}.{merge.target}'
-                missing.extend(f'{catalog_path}.{field}' for field in catalog_schema.model_fields
+                missing.extend(f'{catalog_path}.{field}' for field in catalog_schema.model_json_schema()['properties']
                                if field not in catalog[merge.target].model_fields_set)
             if profile_field:
                 path = f'$.information.{profile_field}.{merge.target}'
@@ -321,7 +341,7 @@ def merge_bundle_errors(correction, information):
             for field, _, _, merge, missing in merge_bundle_gaps(correction, information)]
 
 
-def apply_information(current, review, register, complete=True):
+def apply_information(current, review, register, complete=True, chunks=()):
     """按对象增量修改档案，并同步显式实体合并。"""
     bundle_errors = merge_bundle_errors(review.correction, review.information)
     if bundle_errors:
@@ -370,13 +390,19 @@ def apply_information(current, review, register, complete=True):
                 signature['actual_subjects'] = list(dict.fromkeys(
                     renames.get(key, key) for key in signature.get('actual_subjects', [])))
     details = RepositoryInformation.model_validate(value)
+    asset_renames = {merge.source: merge.target for field in
+                    ('entity_merges', 'location_merges', 'object_merges')
+                    for merge in getattr(review.correction, field)}
+    details.initial_state = remap_assets(details.initial_state, asset_renames)
+    if chunks:
+        normalize_evidence(details.initial_state, chunks)
     errors = information_errors(details, register, complete=complete)
     if errors:
         raise ValueError('\n'.join(errors))
     return details
 
 
-def apply_foundation_review(foundation, check):
+def apply_foundation_review(foundation, check, chunks=()):
     """复用目录和档案修订协议处理全文基础资料核对。"""
     review = Review(
         is_valid=False, summary=check.summary, issues=check.issues, covered_chunks=[],
@@ -389,11 +415,11 @@ def apply_foundation_review(foundation, check):
     if bundle_errors:
         raise DeliveryStructureError('\n'.join(bundle_errors) +
             '\n请在同一份修订中一次交齐上述保留对象；未接收前source目录、档案及引用均保持不变。')
-    world = apply_correction(World(**foundation.catalog.model_dump()), review)
+    world = apply_correction(World(**foundation.catalog.model_dump()), review, chunks)
     errors = register_errors(world)
     if errors:
         raise ValueError('\n'.join(errors))
-    information = apply_information(foundation.information, review, world, complete=False)
+    information = apply_information(foundation.information, review, world, complete=False, chunks=chunks)
     return Foundation(
         catalog=Register.model_validate(world.model_dump()),
         information=information.model_dump(mode='json'),

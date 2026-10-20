@@ -28,7 +28,7 @@ from common.novel_extract.NovelExtractSchema import (
 )
 from common.novel_extract.NovelExtractReader import chunk_text
 from common.novel_extract.NovelExtractRuntime import DeliveryStructureError
-from workflows.NovelExtractWorkflow import NovelExtractWorkflow
+from workflows.NovelExtractWorkflow import DEFAULT_REVIEW_ROUNDS, NovelExtractWorkflow
 
 
 def profile(activity='npc', **values):
@@ -151,7 +151,7 @@ class MergeBundleTests(unittest.TestCase):
         class FinalStorage(Storage):
             @staticmethod
             def get(key, default=None):
-                return {'rounds': 7} if key == 'review_state' else default
+                return {'rounds': DEFAULT_REVIEW_ROUNDS - 1} if key == 'review_state' else default
 
         final_workflow = NovelExtractWorkflow()
         final_workflow.storage, final_workflow.failures = FinalStorage(), []
@@ -497,6 +497,30 @@ class MergeBundleTests(unittest.TestCase):
         self.assertTrue(any(issue.startswith('档案修订未接收：information.relations')
                             for issue in complete_but_invalid.issues))
 
+        # 排时最初合法；身份合并回退后，旧N1与保留的新N2重号。
+        # 拒绝重放后的时间方案，不能把原time_valid当成对旧草稿的确认。
+        rejected_time = Review(
+            is_valid=True, time_valid=True, summary='合并人物并交换节点', issues=[], covered_chunks=[1],
+            correction=Correction(
+                entities={'ENT_1': Entity(name='甲', aliases=[], description='合并后甲')},
+                entity_merges=[EventMerge(source='ENT_C1_1', target='ENT_1', reason='同人')]),
+            information={
+                'characters': {'ENT_1': profile('主角', profile='合并后的甲')},
+                'relations': '错误的关系表类型'},
+            time=Timeline(complete=True,
+                nodes=[TimeNode(id='N1', name='出发', order=2), TimeNode(id='N2', name='到达', order=1)],
+                timeline=[
+                    TimePlacement(id='EVT_1', node_id='N1', order=1, basis='修订后的阶段'),
+                    TimePlacement(id='EVT_2', node_id='N2', order=1, basis='先到达'),
+                    TimePlacement(id='EVT_3', node_id='N2', order=2, basis='后观察')]))
+        candidate, details = second.evaluate_review(rejected_time, world, chunks)
+        self.assertEqual([node.order for node in candidate.time_nodes], [1, 2])
+        self.assertIn('ENT_C1_1', candidate.entities)
+        self.assertEqual(details, information)
+        self.assertTrue(any('合并隔离后的独立时间修订未接收' in issue
+                            for issue in rejected_time.issues))
+        self.assertFalse(rejected_time.time_valid)
+
     def test_invalid_catalog_merge_does_not_discard_unrelated_fact_or_time(self):
         chunks = chunk_text('甲出发。\n乙到达。')
         first = Event(
@@ -518,7 +542,8 @@ class MergeBundleTests(unittest.TestCase):
             is_valid=False, summary='错误物品合并不影响乙', issues=[], covered_chunks=[],
             correction=Correction(
                 objects={'OBJ_1': Object(name='物品', aliases=[], description='',
-                                         location_id=None, owner_name=None)},
+                                         location_id=None, owner_name=None,
+                                         function=None, significance=None, evidence=[])},
                 object_merges=[EventMerge(source='OBJ_MISSING', target='OBJ_1', reason='错误合并')],
                 event_updates={'EVT_2': {'description': '乙正式到达'}}),
             time=Timeline(timeline=[

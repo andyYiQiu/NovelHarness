@@ -102,24 +102,23 @@ class NovelExtractAgent:
                     repair = {'previous_candidate': previous,
                         'repair': '保留未被点名的内容，一次修复全部错误，返回符合当前协议的修订。',
                         'errors': saved['error']}
-                    # 全文档案核对必须保留原文，避免修格式时凭空补造人物。
-                    # 后续局部检查仍用紧凑修复，避免重复搬运全文。
-                    task = encode(repair) if role == 'check' else task + '\n' + encode(repair)
+                    # 只有完整JSON候选的格式修复可省去原文；截断或缺候选须重交完整任务。
+                    compact = (role == 'check' and isinstance(previous, dict)
+                               and not saved.get('response_incomplete', False))
+                    task = encode(repair) if compact else task + '\n' + encode(repair)
                 self.log.write('stage', job=job, role=role, attempt=attempt, status='running')
                 token = CALL_SCOPE.set((job, attempt))
                 try:
                     response = await agent.run(task=task)
                     raw = response.messages[-1].content
                     require(isinstance(raw, str), '智能体回复不是文本')
-                    saved.update(status='received', response=raw, state=await agent.save_state())
+                    saved.update(status='received', response=raw, response_incomplete=False,
+                                 state=await agent.save_state())
                     self.storage.snapshot(stage, saved)
                 except ModelResponseError as exc:
-                    # 接口失败不向会话添加未交付的半条消息；恢复已保存状态。
-                    agent = AssistantAgent(name=role, model_client=self.client, system_message=system,
-                                           reflect_on_tool_use=False)
-                    if saved.get('state'):
-                        await agent.load_state(saved['state'])
-                    saved.update(error=str(exc), status='pending', attempt=attempt + 1)
+                    # 未交付响应不进入会话；下一次attempt统一重建并携带原始任务。
+                    saved.update(error=str(exc), status='pending', attempt=attempt + 1,
+                                 response_incomplete=True)
                     self.storage.snapshot(stage, saved)
                     continue
                 finally:

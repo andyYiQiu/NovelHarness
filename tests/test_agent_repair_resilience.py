@@ -13,6 +13,7 @@ from common.novel_extract.NovelExtractSchema import (
     Correction, Entity, EventMerge, Foundation, FoundationFullReview, Review, merge_bundle_errors,
 )
 from common.novel_extract.NovelExtractRuntime import DeliveryStructureError, JobFailed
+from model.ModelClient import ModelResponseError
 
 
 class Catalog(BaseModel):
@@ -55,6 +56,8 @@ class FixedAssistant:
         index = type(self).runs
         type(self).runs += 1
         content = type(self).responses[min(index, len(type(self).responses) - 1)]
+        if isinstance(content, BaseException):
+            raise content
         return SimpleNamespace(messages=[SimpleNamespace(content=content)])
 
     async def save_state(self):
@@ -133,6 +136,52 @@ class AgentRepairResilienceTests(unittest.TestCase):
         self.assertEqual(repair['novel_source'], '甲在清晨出发。')
         self.assertIn('previous_candidate', FixedAssistant.tasks[1])
         self.assertEqual(result.information.characters['ENT_1'].activity, '主角')
+
+    def test_truncated_reply_restores_context_after_interruption(self):
+        context = {'source_chunks': [{'text': '甲出发。'}], 'world': {'events': ['E1']}}
+        valid = json.dumps({'catalog': {'world_traits': {'WORLD_1': '原文习俗'}}})
+        FixedAssistant.responses = [ModelResponseError('finish_reason=length'), KeyboardInterrupt(), valid]
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_agent(job='global.review.truncated', role='check', context=context)
+        pending = self.storage.latest('job:global.review.truncated')
+        self.assertEqual(pending['attempt'], 1)
+        self.assertTrue(pending['response_incomplete'])
+
+        self.run_agent(job='global.review.truncated', role='check', context=context)
+
+        self.assertEqual(FixedAssistant.tasks[1], FixedAssistant.tasks[2])
+        task, feedback = FixedAssistant.tasks[-1].split('\n', 1)
+        self.assertEqual(json.loads(task), context)
+        self.assertIsNone(json.loads(feedback)['previous_candidate'])
+        self.assertFalse(self.storage.latest('job:global.review.truncated')['response_incomplete'])
+
+    def test_truncation_does_not_treat_stale_candidate_as_current_delivery(self):
+        invalid = {'catalog': {}}
+        valid = {'catalog': {'world_traits': {'WORLD_1': '原文习俗'}}}
+        context = {'source_chunks': [{'text': '甲出发。'}], 'world': {'events': ['E1']}}
+        FixedAssistant.responses = [json.dumps(invalid), ModelResponseError('finish_reason=length'), json.dumps(valid)]
+
+        self.run_agent(job='global.review.stale', role='check', context=context)
+
+        self.assertNotIn('source_chunks', json.loads(FixedAssistant.tasks[1]))
+        task, feedback = FixedAssistant.tasks[2].split('\n', 1)
+        self.assertEqual(json.loads(task), context)
+        self.assertEqual(json.loads(feedback)['previous_candidate'], invalid)
+        self.assertEqual(self.storage.latest('job:global.review.stale')['result'], valid)
+
+    def test_unparseable_reply_keeps_context_and_repeated_truncation_is_bounded(self):
+        context = {'source_chunks': [{'text': '甲出发。'}], 'world': {'events': ['E1']}}
+        FixedAssistant.responses = ['{"catalog":', '{"catalog":{"world_traits":{}}}']
+        self.run_agent(job='global.review.json', role='check', context=context)
+        self.assertEqual(json.loads(FixedAssistant.tasks[1].split('\n', 1)[0]), context)
+
+        FixedAssistant.tasks, FixedAssistant.runs = [], 0
+        FixedAssistant.responses = [ModelResponseError('finish_reason=length')]
+        with self.assertRaises(JobFailed):
+            self.run_agent(job='global.review.bound', role='check', context=context)
+        self.assertEqual(FixedAssistant.runs, 3)
+        self.assertTrue(all(json.loads(t.split('\n', 1)[0]) == context for t in FixedAssistant.tasks))
+        self.assertEqual(self.storage.latest('job:global.review.bound')['status'], 'failed')
 
     def test_formal78_style_repair_moves_root_trait_and_completes(self):
         FixedAssistant.responses = [

@@ -19,6 +19,8 @@ from common.novel_extract.NovelExtractSchema import (
     Review,
     TimeCheck,
     TimeNode,
+    TimePlacement,
+    Timeline,
     World,
     apply_correction,
     evidence_errors,
@@ -165,8 +167,7 @@ class SafetyContractTests(unittest.TestCase):
             "relations": [old_relation],
             "changes": [old_change],
         })
-        removal = EventRemoval(id="BAD", reason="实际发生不能由获知替代",
-                               signature=bad.occurrence_signature)
+        removal = EventRemoval(id="BAD", reason="实际发生不能由获知替代")
         incomplete = Review(
             is_valid=False, summary="以正确实际发生替代错误获知事件", issues=[], covered_chunks=[],
             correction=Correction(events=[good], removals=[removal]),
@@ -193,6 +194,67 @@ class SafetyContractTests(unittest.TestCase):
         self.assertEqual(revised.changes[0].event_id, "GOOD")
         self.assertEqual(revised.changes[0].change, "甲开始新的经历")
         self.assertEqual([item.id for item in world.events], ["BAD", "LATER"])
+
+    def test_removal_uses_current_id_without_recopying_signature(self):
+        self.assertNotIn("signature", EventRemoval.model_json_schema()["properties"])
+        review = Review(is_valid=False, summary="删除已核实的错误记录", issues=[],
+                        covered_chunks=[], correction=Correction(
+                            removals=[EventRemoval(id="A", reason="原文不支持")]))
+        self.assertEqual(apply_correction(self.world, review).events, [])
+        review.correction.removals[0].id = "MISSING"
+        with self.assertRaisesRegex(ValueError, "不存在的事件"):
+            apply_correction(self.world, review)
+        self.assertEqual([e.id for e in self.world.events], ["A"])
+
+    def test_merge_and_changed_time_are_accepted_or_rejected_together(self):
+        source, target = event("SOURCE", node="N1", order=1), event("TARGET", node="N2", order=1)
+        later = event("LATER", actor="ENT_2", node="N3", order=1)
+        world = self.world.model_copy(update={
+            "events": [source, target, later],
+            "time_nodes": [TimeNode(id=f"N{i}", name=f"阶段{i}", order=i) for i in (1, 2, 3)],
+            "relations": [Relation(source="SOURCE", target="LATER", kind="before", basis="先后")],
+            "changes": [Change(event_id="SOURCE", subject_id="ENT_1", change="已经出发", basis="原文")],
+        }, deep=True)
+        before = world.model_dump()
+        review = Review(is_valid=False, summary="同一发生去重并纠正旧位置", issues=[], covered_chunks=[],
+            correction=Correction(events=[target], merges=[
+                EventMerge(source="SOURCE", target="TARGET", reason="同一出发")]),
+            time=Timeline(complete=True,
+                nodes=[TimeNode(id="N1", name="出发", order=1), TimeNode(id="N2", name="后来", order=2)],
+                timeline=[TimePlacement(id="TARGET", node_id="N1", order=1, basis="先出发"),
+                          TimePlacement(id="LATER", node_id="N2", order=1, basis="后抵达")]))
+        revised = apply_correction(world, review, self.chunks)
+        self.assertEqual([(e.id, e.time_node_id) for e in revised.events],
+                         [("TARGET", "N1"), ("LATER", "N2")])
+        self.assertEqual(revised.relations[0].source, "TARGET")
+        self.assertEqual(revised.changes[0].event_id, "TARGET")
+        for kind in ("no_time", "partial", "missing_event", "unknown_node_order",
+                     "unknown_event_order", "contradiction", "different_occurrence"):
+            rejected = review.model_copy(deep=True)
+            if kind == "no_time": rejected.time = None
+            if kind == "partial": rejected.time.complete = False
+            if kind == "missing_event": rejected.time.timeline.pop()
+            if kind == "unknown_node_order": rejected.time.nodes[0].order = None
+            if kind == "unknown_event_order": rejected.time.timeline[0].order = None
+            if kind == "contradiction":
+                rejected.time.timeline[0].node_id, rejected.time.timeline[1].node_id = "N2", "N1"
+            if kind == "different_occurrence":
+                rejected.correction.events[0].occurrence_signature.occurrence = "另一件事"
+            with self.subTest(kind=kind), self.assertRaises(ValueError):
+                apply_correction(world, rejected, self.chunks)
+            self.assertEqual(world.model_dump(), before)
+
+    def test_repeated_reference_removal_is_idempotent_but_updates_cannot_conflict(self):
+        from common.novel_extract.NovelExtractRevision import update_records
+        row = Change(event_id="A", subject_id="ENT_1", change="已经出发", basis="原文")
+        removal = ChangeRemoval(**row.model_dump(), reason="迁入正确事件")
+        repeated = removal.model_copy(update={"reason": "删除同一旧记录"})
+        fields = ("event_id", "subject_id", "change")
+        references = {"event_id": {"A"}, "subject_id": {"ENT_1"}}
+        self.assertEqual(update_records([row], [], [removal, repeated], fields, references), [])
+        with self.assertRaisesRegex(ValueError, "重复修改编号"):
+            update_records([row], [row, row.model_copy(update={"basis": "另一依据"})], [],
+                           fields, references)
 
     @unittest.skip("Legacy proof-table protocol retired; see reports/novel_extract/shadowloom_validation_reset_20261016/retired_tests.md")
     def test_candidate_signature_survives_accepted_entity_redirect(self):

@@ -1,10 +1,11 @@
 """本项目的数据协议；程序验证引用与时间结构，不代替模型判断事实。"""
 from collections import Counter
+from collections.abc import Iterable
 from copy import deepcopy
 import re
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field, StringConstraints, field_validator, model_validator
+from pydantic import BaseModel, Field, StringConstraints, field_validator, model_serializer, model_validator
 from pydantic.json_schema import SkipJsonSchema
 
 class Record(BaseModel):
@@ -38,8 +39,12 @@ class Location(Entity):
 
 
 class Object(Entity):
-    location_id: str | None = None
-    owner_name: str | None = None
+    # 历史目录可读；新提取的归属与位置进入初始状态及事件delta。
+    location_id: SkipJsonSchema[str | None] = None
+    owner_name: SkipJsonSchema[str | None] = None
+    function: str | None = None
+    significance: str | None = None
+    evidence: list['Evidence'] = Field(default_factory=list)
 
 
 class Locations(Record):
@@ -71,6 +76,92 @@ class Evidence(Record):
     passage_ids: list[str] = Field(default_factory=list,
         description='选择支持此事的原文片段编号；程序回填完整原文，不复抄或概括引文',
         json_schema_extra={'minItems': 1})
+
+
+class ReferenceState(Record):
+    status: Literal['known', 'none', 'unknown']
+    id: str | None = None
+
+    @model_validator(mode='after')
+    def consistent_reference(self):
+        if (self.status == 'known' and not self.id) or (self.status != 'known' and self.id is not None):
+            raise ValueError('known须提供编号；none/unknown的id须为null')
+        return self
+
+
+RelationStatus = Literal['active', 'inactive', 'unknown']
+
+
+class RelationIdentity(Record):
+    owner_id: str
+    other_id: str
+    relation: str = Field(min_length=1, description='other相对于owner的关系；每项只写一种关系')
+
+
+class RelationState(RelationIdentity):
+    status: RelationStatus
+    detail: str | None = None
+    evidence: list[Evidence] = Field(min_length=1)
+
+
+class ObjectState(Record):
+    owner: ReferenceState = Field(default_factory=lambda: ReferenceState(status='unknown'))
+    holder: ReferenceState = Field(default_factory=lambda: ReferenceState(status='unknown'))
+    location: ReferenceState = Field(default_factory=lambda: ReferenceState(status='unknown'))
+    condition: str | None = None
+    evidence: list[Evidence] = Field(default_factory=list)
+
+
+class AssetState(Record):
+    relations: list[RelationState] = Field(default_factory=list)
+    objects: dict[str, ObjectState] = Field(default_factory=dict)
+
+
+class StatePatch(Record):
+    model_config = {'extra': 'forbid'}
+
+    @model_serializer(mode='wrap')
+    def supplied_fields_only(self, handler):
+        # 保存/恢复必须区分“未修改”与“明确改为未知”，不能补出省略字段。
+        return {key: value for key, value in handler(self).items() if key in self.model_fields_set}
+
+    @model_validator(mode='after')
+    def nonempty_patch(self):
+        if not self.model_fields_set:
+            raise ValueError('set须至少包含一个实际更新字段')
+        if any(getattr(self, key) is None for key in self.model_fields_set - {'detail', 'condition'}):
+            raise ValueError('状态或引用不能整体为null；未知用unknown，明确无人用none')
+        return self
+
+
+class RelationStatePatch(StatePatch):
+    status: RelationStatus | SkipJsonSchema[None] = None
+    detail: str | None = None
+
+
+class ObjectStatePatch(StatePatch):
+    owner: ReferenceState | SkipJsonSchema[None] = None
+    holder: ReferenceState | SkipJsonSchema[None] = None
+    location: ReferenceState | SkipJsonSchema[None] = None
+    condition: str | None = None
+
+
+class RelationDelta(RelationIdentity):
+    set: RelationStatePatch
+    basis: str = Field(min_length=1)
+    evidence: list[Evidence] = Field(min_length=1)
+
+
+class ObjectDelta(Record):
+    object_id: str
+    set: ObjectStatePatch
+    basis: str = Field(min_length=1)
+    evidence: list[Evidence] = Field(min_length=1)
+
+
+class StateDelta(Record):
+    relations: list[RelationDelta] = Field(default_factory=list)
+    objects: list[ObjectDelta] = Field(default_factory=list)
 
 
 OccurrenceLayer = (Literal['实际发生', '讲述', '获知', '意图/计划']
@@ -107,6 +198,8 @@ class Event(Record):
     goals: dict[str, str] = Field(default_factory=dict,
         description='参与者人物编号到其目的，例如 {"ENT_1":"离开此地"}；键不能是目的名称，未知目的用空对象')
     required_results: list[str] | None = None
+    state_delta: StateDelta | None = Field(default=None,
+        description='consequences交付后保存；null表示尚未检查状态变化，空relations/objects表示确无变化')
     occurrence_layer: OccurrenceLayer = Field(
         description='故事世界中的发生层次；与epistemic_status的证据性质分开，选择实际发生、讲述、获知或意图/计划')
     occurrence_signature: OccurrenceSignature | SkipJsonSchema[None] = Field(
@@ -191,6 +284,8 @@ class EventPass(Topology):
 
 class Consequences(Record):
     changes: list[Change]
+    state_deltas: dict[str, StateDelta] = Field(default_factory=dict,
+        description='每个现存event_id到关系/物品变化；没有变化也交空relations/objects，不写整份快照')
     coverage: str = Field(min_length=1)
 
 
@@ -205,10 +300,10 @@ class EventMerge(Record):
 
 
 class EventRemoval(Record):
-    id: str
+    id: str = Field(description='本轮world中要删除的事件编号；程序从该快照绑定旧发生，不复抄签名')
     reason: str = Field(min_length=1)
-    signature: OccurrenceSignature = Field(
-        description='原样绑定修订前已保存Event的发生签名；reading候选去向由CandidateCheck单独交付')
+    # 兼容历史交付；显式附带旧签名时仍须精确匹配，不能静默忽略冲突。
+    signature: SkipJsonSchema[OccurrenceSignature | None] = None
 
 
 class TimePlacement(Record):
@@ -285,10 +380,14 @@ class Correction(RegisterCorrection):
         description='已有事件编号到需要修改的字段；未提交字段原样保留。新增事件用events，时间用time')
     merges: list[EventMerge] = Field(default_factory=list)
     removals: list[EventRemoval] = Field(default_factory=list)
-    relations: list[Relation] | None = None
-    changes: list[Change] | None = None
-    relation_removals: list['RelationRemoval'] = Field(default_factory=list)
-    change_removals: list['ChangeRemoval'] = Field(default_factory=list)
+    relations: list[Relation] | None = Field(default=None,
+        description='增量新增/更新关系，不替换整表；迁移引用须同时用relation_removals显式删除旧边')
+    changes: list[Change] | None = Field(default=None,
+        description='增量新增/更新状态变化，不替换整表；迁移引用须同时用change_removals显式删除旧记录')
+    relation_removals: list['RelationRemoval'] = Field(default_factory=list,
+        description='显式删除旧关系，原样匹配当前source/target/kind；删除事件前须处理所有入边和出边')
+    change_removals: list['ChangeRemoval'] = Field(default_factory=list,
+        description='显式删除旧状态变化，原样匹配当前event_id/subject_id/change；删除事件前须处理其全部记录')
 
 class RelationRemoval(Relation):
     reason: str = Field(min_length=1)
@@ -504,7 +603,7 @@ def source_quote(quote, source):
 
 def normalize_evidence(events, chunks):
     """原始回复另行保存；接收对象中的引文使用精确原文，无法定位的仍交校验。"""
-    for event in events:
+    for event in evidence_records(events):
         resolved = []
         for index, evidence in enumerate(event.evidence):
             path = f'{getattr(event, "id", "candidate")}.evidence[{index}]'
@@ -521,8 +620,8 @@ def normalize_evidence(events, chunks):
                 mismatch = evidence.unverified_quote
                 if evidence.quote and not any(source_quote(evidence.quote, text) for text in selected):
                     mismatch = evidence.quote
-                resolved.extend(Evidence(chunk=evidence.chunk, quote=text, unverified_quote=mismatch)
-                                for text in selected)
+                resolved.extend(Evidence(chunk=evidence.chunk, quote=text, passage_ids=[key], unverified_quote=mismatch)
+                                for key, text in zip(evidence.passage_ids, selected))
                 continue
             if 1 <= evidence.chunk <= len(chunks):
                 quote = source_quote(evidence.quote, chunks[evidence.chunk - 1].text)
@@ -532,9 +631,25 @@ def normalize_evidence(events, chunks):
         event.evidence = resolved
 
 
+def evidence_records(value):
+    """统一遍历事件、物品、状态及其delta的来源，不复制证据处理逻辑。"""
+    if isinstance(value, BaseModel):
+        if hasattr(value, 'evidence'):
+            yield value
+        for name in type(value).model_fields:
+            if name != 'evidence':
+                yield from evidence_records(getattr(value, name))
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from evidence_records(item)
+    elif isinstance(value, Iterable) and not isinstance(value, (str, bytes)):
+        for item in value:
+            yield from evidence_records(item)
+
+
 def evidence_errors(records, chunks):
     errors = []
-    for record in records:
+    for record in evidence_records(records):
         for evidence in record.evidence:
             if not evidence.quote or not 1 <= evidence.chunk <= len(chunks) or evidence.quote not in chunks[evidence.chunk - 1].text:
                 errors.append(f'第{evidence.chunk}块证据不是连续原文：{evidence.quote[:80]!r}；'
@@ -641,7 +756,8 @@ def topology_errors(topology, register, chunks, check_time=False):
             errors.append(f'changes: 非法引用 {change.event_id}/{change.subject_id}')
     if check_time:
         errors.extend(temporal_errors(topology))
-    return errors
+    from common.novel_extract.NovelExtractState import asset_errors
+    return errors + asset_errors(topology, register, chunks)
 
 
 def temporal_errors(topology):
@@ -746,9 +862,12 @@ def timeline_errors(topology, require_complete=False):
 def event_time_content(event):
     """时间依赖实际发生、身份、地点和来源；收录理由、目标说明不撤销时间。"""
     data = event.model_dump(exclude={'time_node_id', 'event_order', 'temporal_basis',
-                                     'core_reason', 'goals', 'required_results'})
+                                     'core_reason', 'goals', 'required_results', 'state_delta'})
     for evidence in data['evidence']:
         evidence.pop('unverified_quote', None)
+        if evidence['quote']:
+            # 引文定位后，补留片段编号不改变其实际时间依据，兼容旧确认哈希。
+            evidence['passage_ids'] = []
     return data
 
 
@@ -800,10 +919,11 @@ def time_dependencies(world):
                              if e.time_node_id in nodes else None,
                              'order': e.event_order} for e in members},
             'relations': sorted(relations, key=lambda r: (r['source'], r['target'], r['kind'])),
-            # 模型只需为每对比较交付一次；确认版本则由两个端点共同绑定。这样任一端
-            # 的发生依据或邻接变化都会局部撤销这一边界，不会把变化扩散到非相邻节点。
+            # 这些比较边仅绑定确认版本，不要求模型逐对交付证明。
+            # 任一端的发生依据或邻接变化，只撤销受影响边界的确认。
             'comparisons': sorted(incident, key=lambda row: (row['other'], row['scope'], row['draft'])),
-            **{field: {k: getattr(world, field)[k].model_dump(exclude={'description'}, mode='json') for k in sorted(keys)}
+            **{field: {k: getattr(world, field)[k].model_dump(
+                exclude={'description', 'function', 'significance', 'evidence'}, mode='json') for k in sorted(keys)}
                for field, keys in references.items()}}
     return result
 
@@ -947,6 +1067,8 @@ class RepositoryInformation(Record):
     background: BackgroundInformation
     settings: list[SettingInformation] = Field(default_factory=list)
     relations: list[RelationInformation] = Field(default_factory=list)
+    initial_state: AssetState | None = Field(default=None,
+        description='故事实际起点之前的已知关系与物品状态；后期才成立的状态不得前置，缺乏依据保留未知')
 
 
 class Foundation(Record):
@@ -1035,4 +1157,7 @@ def information_errors(information, register, complete=True):
     for relation in information.relations:
         if relation.owner not in register.entities or relation.other not in register.entities or relation.owner == relation.other:
             errors.append(f'关系引用非法：{relation.owner} → {relation.other}')
+    if information.initial_state is not None:
+        from common.novel_extract.NovelExtractState import state_reference_errors
+        errors.extend(state_reference_errors(information.initial_state, register, 'initial_state'))
     return errors

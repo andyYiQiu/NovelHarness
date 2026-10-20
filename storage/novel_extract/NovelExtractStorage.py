@@ -10,7 +10,7 @@ from common.novel_extract.NovelExtractRuntime import encode, require, safe_path,
 
 
 class NovelExtractStorage:
-    FORMAT_VERSION = 37
+    FORMAT_VERSION = 39
 
     def __init__(self, path):
         self.path = safe_path(path)
@@ -52,7 +52,7 @@ class NovelExtractStorage:
                     'source_sha256', 'fingerprint', 'policy', 'output', 'log_dir', 'phase', 'position', 'review_position', 'review_state', 'export')
             result = {k: meta[k] for k in keys if k in meta}
             tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-            if 'calls' in tables and meta.get('format') in (26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37):
+            if 'calls' in tables and meta.get('format') in range(26, NovelExtractStorage.FORMAT_VERSION + 1):
                 result['requests'] = db.execute('SELECT count(*) FROM calls').fetchone()[0]
                 result['responses'] = db.execute('SELECT count(*) FROM calls WHERE response IS NOT NULL').fetchone()[0]
                 result['unknown_requests'] = db.execute('SELECT count(*) FROM calls WHERE ended IS NULL').fetchone()[0]
