@@ -10,7 +10,7 @@ from common.novel_extract.NovelExtractRuntime import encode, require, safe_path,
 
 
 class NovelExtractStorage:
-    FORMAT_VERSION = 39
+    FORMAT_VERSION = 40
 
     def __init__(self, path):
         self.path = safe_path(path)

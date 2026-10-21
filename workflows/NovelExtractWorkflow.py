@@ -4,6 +4,7 @@ import asyncio
 from collections import Counter
 from copy import deepcopy
 from hashlib import sha256
+from importlib import import_module
 from importlib.metadata import version
 import json
 import os
@@ -28,11 +29,13 @@ from common.novel_extract.NovelExtractRevision import (
 )
 
 DEFAULT_REVIEW_ROUNDS = 8
+PARTIAL_RECOVERY_ROUNDS = 6
 
 
 class ReviewState(BaseModel):
     """工作流拥有阶段状态；与该阶段资料修订一起原子保存。"""
     rounds: int = 0
+    recovery_start_round: int | None = None
     time_reviewed: bool = False
     accepted: bool = False
     confirmed_times: dict[str, str] = Field(default_factory=dict)
@@ -70,12 +73,15 @@ def substantive_world(world):
 
 class NovelExtractWorkflow:
     def arguments(self, argv=None):
-        parser = argparse.ArgumentParser(description='AutoGen：全文目录及档案 → 分块 → 核心事件抽取 → 结构修复 → 跨块/时间校验 → repository')
+        parser = argparse.ArgumentParser(description='AutoGen：小说提取 → repository；指定 --database 后继续 SQLite 入库与事件语义索引')
         parser.add_argument('--input', type=Path)
         parser.add_argument('--config', type=Path, default=Path('model/config.local.json'))
         parser.add_argument('--workspace', type=Path, required=True)
         parser.add_argument('--output', type=Path)
         parser.add_argument('--log-dir', type=Path)
+        parser.add_argument('--database', type=Path, help='complete 导出后自动入库并建立同名 .faiss 索引；省略时只提取')
+        parser.add_argument('--embedding-model', type=Path, default=ROOT / '.embedding_models/JinaV3',
+                            help='完整本地 Jina v3 模型目录，仅 --database 流程使用')
         parser.add_argument('--max-steps', type=int, default=1000, help='累计 HTTP 请求上限，含重试；同时受配置 max_calls 约束')
         parser.add_argument('--max-request-chars', type=int, default=0, help='完整请求字符限制；0 不另加限制，接口仍有上下文限制')
         parser.add_argument('--concurrency', type=int, default=16, help='最大并行文本块数；不并行同块依赖步骤')
@@ -90,7 +96,10 @@ class NovelExtractWorkflow:
             if args.status:
                 print(json.dumps(NovelExtractStorage.read_status(args.workspace), ensure_ascii=False, indent=2))
                 return 0
-            return self.execute(args)
+            result = self.execute(args)
+            if result == 0 and args.database and not args.preflight:
+                self.finish_repository(args)
+            return result
         except KeyboardInterrupt:
             print('已中断。工作区及收到的响应保留；同一命令可续跑。')
             return 130
@@ -100,6 +109,58 @@ class NovelExtractWorkflow:
         except (ValueError, OSError) as exc:
             print('未完成：' + str(exc))
             return 1
+
+    @staticmethod
+    def database_paths(args):
+        database = safe_path(args.database)
+        return database, safe_path(database.with_suffix('.faiss'))
+
+    def prepare_paths(self, args, source_path, config_path):
+        """统一检查提取和后处理路径，提前发现缺模型、目标占用或产物重叠。"""
+        output, log_dir, workspace = safe_path(args.output), safe_path(args.log_dir), safe_path(args.workspace)
+        # 输出发布与日志/数据库不得互相包含，更不能覆盖输入。
+        require(not output.exists() or output.is_dir(), '输出路径不是目录')
+        paths = (output, log_dir, workspace)
+        protected = (source_path, config_path)
+        if args.database:
+            # 在可能产生付费请求前检查收尾工具、模型及路径；这里不加载模型或编码。
+            import_module('tools.EventIndex')
+            from tools.JinaEmbedding import JinaEmbedding
+
+            database, index = self.database_paths(args)
+            model_path = safe_path(args.embedding_model)
+            JinaEmbedding(model_path)
+            delivery_paths = (database, index, safe_path(Path(str(index) + '.json')))
+            paths += (*delivery_paths, safe_path(Path(str(database) + '.embedding.lock')))
+            protected += (model_path,)
+            if any(path.exists() for path in delivery_paths):
+                require(workspace.exists() and NovelExtractStorage.read_status(workspace).get('status') == 'complete',
+                        '仅 complete 的后处理可复用已有产物；新实验的数据库和索引须使用新路径')
+        require(all(left != right and left not in right.parents and right not in left.parents
+                    for index, left in enumerate(paths) for right in paths[index + 1:]), '输出、日志、工作区、数据库及索引路径不能重叠')
+        require(all(path != source and path not in source.parents and source not in path.parents
+                    for path in paths for source in protected), '产物路径不能覆盖输入、配置或模型目录')
+        return output, log_dir, workspace
+
+    def finish_repository(self, args):
+        """收尾只编排现有工具；失败保全 complete 提取和已保存的向量批次。"""
+        from sqlalchemy.exc import DBAPIError, SQLAlchemyError
+        from tools.EventIndex import build_index
+        from tools.ImportRepository import import_repository
+        from tools.JinaEmbedding import JinaEmbedding
+
+        database, index = self.database_paths(args)
+        try:
+            print('repository 已 complete，正在核对并写入 SQLite……')
+            import_repository(args.output, database, workspace=args.workspace, reuse_existing=True)
+            print('SQLite 已就绪，正在生成或复用事件向量与 FAISS 索引……')
+            with JinaEmbedding(args.embedding_model) as encoder:
+                result = build_index(database, index, encoder)
+        except (OSError, ValueError, RuntimeError, SQLAlchemyError) as exc:
+            detail = exc.orig if isinstance(exc, DBAPIError) else exc
+            raise ValueError(f'提取结果已保留，入库/索引未完成：{detail}；修复后可用同一命令继续后处理') from exc
+        print('完整交付：' + json.dumps({'repository': str(args.output), 'database': str(database), **result},
+                                    ensure_ascii=False))
 
     def execute(self, args):
         from agents.NovelExtractAgent import NovelExtractAgent
@@ -112,17 +173,13 @@ class NovelExtractWorkflow:
         source_path = safe_path(args.input)
         text = source_path.read_text(encoding='utf-8')
         require(bool(text.strip()), '输入原文为空')
-        config = ModelClient.read_config(safe_path(args.config))
-        output, log_dir, workspace = safe_path(args.output), safe_path(args.log_dir), safe_path(args.workspace)
-        # 输出发布与日志/数据库不得互相包含，更不能覆盖输入。
-        require(not output.exists() or output.is_dir(), '输出路径不是目录')
-        paths = (output, log_dir, workspace)
-        require(all(left != right and left not in right.parents and right not in left.parents
-                    for index, left in enumerate(paths) for right in paths[index + 1:]), '输出、日志与工作区路径不能重叠')
-        require(all(path != source_path and path not in source_path.parents for path in paths), '产物路径不能覆盖输入')
+        config_path = safe_path(args.config)
+        config = ModelClient.read_config(config_path)
+        output, log_dir, workspace = self.prepare_paths(args, source_path, config_path)
         policy = {'config': config, 'concurrency': args.concurrency, 'chunk_min_chars': 800, 'chunk_max_chars': 1200,
                   'context_tail_chars': 300, 'output_repairs': 5, 'validation_repairs': 2,
                   'review_rounds': DEFAULT_REVIEW_ROUNDS,
+                  'partial_recovery_rounds': PARTIAL_RECOVERY_ROUNDS,
                   'max_calls': min(args.max_steps, config['max_calls']), 'max_request_chars': args.max_request_chars}
         identity = {'format': NovelExtractStorage.FORMAT_VERSION, 'source': source_path.stem,
                     'source_sha256': sha256(text.encode('utf-8')).hexdigest(), 'fingerprint': fingerprint(),
@@ -161,7 +218,7 @@ class NovelExtractWorkflow:
             exporter.check_existing(output)
             if storage.get('status') in ('complete', 'partial'):
                 exporter.export(output, saved_world(storage))
-                print('终态输出已核对/恢复，零模型调用：' + storage.get('status'))
+                print('终态输出已核对/恢复，零新增提取请求：' + storage.get('status'))
                 return 0 if storage.get('status') == 'complete' else 2
             if not has_api_key:
                 raise RunStopped('未设置配置指定的密钥环境变量 ' + config['api_key_env'])
@@ -174,21 +231,18 @@ class NovelExtractWorkflow:
             self.failures = []
             try:
                 world, accepted = asyncio.run(self.extract(text))
+                reasons = self.completion_reasons(world, accepted, exporter)
+                state = ReviewState.model_validate(storage.get('review_state', {}))
+                while reasons and (state.recovery_start_round is None
+                                   or self._review_round_available(state, self.review_rounds)):
+                    world, accepted = asyncio.run(self.reconcile(chunk_text(text), world, recovery_reasons=reasons))
+                    reasons = self.completion_reasons(world, accepted, exporter)
+                    state = ReviewState.model_validate(storage.get('review_state', {}))
             except Exception as exc:
                 # 未分类程序错误与存储错误不伪装成合法 partial。
                 storage.set('last_error', {'type': type(exc).__name__, 'detail': str(exc)})
                 log.write('error', error=type(exc).__name__, detail=str(exc))
                 raise
-            reasons = []
-            if not accepted:
-                reasons.append('跨块资料与时间校验尚未完整通过')
-            if self.failures:
-                reasons.append('存在未完整交付的任务；候选、有效部分及反馈已保留')
-            if storage.latest('information') is None:
-                reasons.append('人物、地点、背景资料尚未完整交付')
-            _, excluded = exporter.project(world)
-            if excluded:
-                reasons.append('部分资料无法满足 repository 引用结构，已列入未完成清单')
             with storage.transaction():
                 storage.snapshot('world', world.model_dump(mode='json'))
                 storage.set('termination', {'reasons': reasons})
@@ -202,6 +256,20 @@ class NovelExtractWorkflow:
             if log:
                 log.close()
             storage.close()
+
+    def completion_reasons(self, world, accepted, exporter):
+        """补救前后共用同一完成标准；导出引用问题也必须处理。"""
+        reasons = []
+        if not accepted:
+            reasons.append('跨块资料与时间校验尚未完整通过')
+        if self.failures:
+            reasons.append('存在未完整交付的任务；候选、有效部分及反馈已保留')
+        if self.storage.latest('information') is None:
+            reasons.append('人物、地点、背景资料尚未完整交付')
+        _, excluded = exporter.project(world)
+        if excluded:
+            reasons.append('部分资料无法满足 repository 引用结构，已列入未完成清单')
+        return reasons
 
     def stage(self, name, **data):
         self.storage.set('stage', name)
@@ -1092,6 +1160,8 @@ class NovelExtractWorkflow:
 
     @staticmethod
     def _review_round_available(state, review_rounds):
+        if state.recovery_start_round is not None:
+            return state.rounds < state.recovery_start_round + PARTIAL_RECOVERY_ROUNDS
         limit = review_rounds
         for item in state.history:
             extra = max(3 if item.get('final_repair_handoff') else 0,
@@ -1101,8 +1171,8 @@ class NovelExtractWorkflow:
                 limit = max(limit, item['round'] + extra)
         return state.rounds < limit
 
-    @staticmethod
-    def repair_receipt(submitted, applied, before, after):
+    @classmethod
+    def repair_receipt(cls, submitted, applied, before, after):
         """把本轮实际接收的修订与仍需处理的引用交回检查角色。"""
         def actions(patch):
             return {
@@ -1132,13 +1202,30 @@ class NovelExtractWorkflow:
         saved = {key: saved_actions[key] for key in attempted}
         rejected = {key: sorted((Counter(value) - Counter(saved[key])).elements())
                     for key, value in attempted.items()}
+        # 仅重交未接收的候选值；保留稀疏字段，避免下一轮把省略误读成null更新。
+        unapplied = {}
+        submitted_patch = submitted.correction.model_dump(mode='json', exclude_unset=True)
+        applied_patch = applied.correction.model_dump(mode='json', exclude_unset=True)
+        for field, rejected_ids in rejected.items():
+            if not rejected_ids:
+                continue
+            value = submitted_patch[field]
+            unapplied[field] = ({key: value[key] for key in rejected_ids}
+                                if isinstance(value, dict) else
+                                [row for row in value if row not in applied_patch.get(field, [])])
         current = {event.id: event for event in after.events}
-        affected = set(rejected.get('event_updates', []) + rejected.get('removals', []))
-        affected.update(key.split('→', 1)[0] for key in rejected.get('merges', []))
-        affected.update(key.split('→', 1)[0] for field in ('relations', 'relation_removals')
-                        for key in rejected.get(field, []))
-        affected.update(key.split('/', 1)[0] for field in ('changes', 'change_removals')
-                        for key in rejected.get(field, []))
+        patch = submitted.correction
+        affected = set(patch.event_updates) | {row.id for row in [*patch.events, *patch.removals]}
+        for row in [*patch.merges, *(patch.relations or []), *patch.relation_removals]:
+            affected.update((row.source, row.target))
+        affected.update(row.event_id for row in [*(patch.changes or []), *patch.change_removals])
+        catalog_ids = set(patch.entities) | set(patch.locations) | set(patch.objects)
+        for row in [*patch.entity_merges, *patch.location_merges, *patch.object_merges]:
+            catalog_ids.update((row.source, row.target))
+        if catalog_ids:
+            for event in after.events:
+                if any(ids & catalog_ids for ids in cls._event_catalog_references(event).values()):
+                    affected.add(event.id)
         references = {key: {
             'exists': key in current,
             'actor_ids': current[key].actor_ids if key in current else [],
@@ -1156,6 +1243,15 @@ class NovelExtractWorkflow:
             'time': {'submitted': submitted.time is not None, 'accepted': applied.time is not None},
             'information': {'submitted': submitted.information is not None,
                             'accepted': applied.information is not None},
+            'unapplied': {
+                'correction': unapplied,
+                'time': (submitted.time.model_dump(mode='json', exclude_unset=True)
+                         if submitted.time is not None and applied.time is None else None),
+                'information': ({key: value for key, value in submitted.information.items()
+                                 if key not in (applied.information or {})
+                                 or value != applied.information[key]}
+                                if submitted.information is not None else None),
+            },
             'saved_event_delta': {
                 'added': sorted(new.keys() - old.keys()),
                 'removed': sorted(old.keys() - new.keys()),
@@ -1172,6 +1268,11 @@ class NovelExtractWorkflow:
         information = self.storage.latest('information')
         context = (self.timeline_context(chunks, world, state)
                    if task == 'timeline' else self.review_context(chunks, world))
+        if state.recovery_start_round is not None:
+            context['recovery_progress'] = {
+                'round': state.rounds - state.recovery_start_round + 1,
+                'round_limit': PARTIAL_RECOVERY_ROUNDS,
+            }
         schema = TimelinePlan if task == 'timeline' else Review
         validate = (self.validate_time_plan_delivery if task == 'timeline' else
                     lambda result: self.validate_review_delivery(
@@ -1283,7 +1384,9 @@ class NovelExtractWorkflow:
         state.resolved_jobs = sorted(set(state.resolved_jobs) | set(review.resolved_jobs))
         state.feedback[task] = {'summary': review.summary, 'model_issues': model_issues,
                                 'program_feedback': program_feedback}
-        if task == 'review' and submitted is not None and repair_needed:
+        if task == 'review' and submitted is not None and (
+                repair_needed or submitted.correction != Correction()
+                or submitted.time is not None or submitted.information is not None):
             state.feedback[task]['repair_receipt'] = self.repair_receipt(
                 submitted, review, world, candidate)
         final_time_handoff = (review_rounds - 1 <= state.rounds <= review_rounds
@@ -1315,16 +1418,28 @@ class NovelExtractWorkflow:
                        time_confirmed=len(state.confirmed_times), events=len(candidate.events),
                        next_task=state.next_task)
 
-    async def reconcile(self, chunks, world):
+    async def reconcile(self, chunks, world, recovery_reasons=None):
         """时间草稿后做一次广义审计；只为具体未决错误继续修复。"""
         state = ReviewState.model_validate(self.storage.get('review_state', {}))
+        if recovery_reasons:
+            if state.recovery_start_round is None:
+                state.recovery_start_round = state.rounds
+            state.accepted, state.next_task = False, 'review'
+            state.feedback['recovery'] = {
+                'issues': recovery_reasons,
+                'instruction': '处理未完成任务和具体拒收反馈；保留已核对的正确资料，必要时修订并重新排时、复核。',
+            }
+            self.storage.set('review_state', state.model_dump(mode='json'))
         if state.accepted:
             return world, True
         review_rounds = getattr(self, 'review_rounds', DEFAULT_REVIEW_ROUNDS)
         while self._review_round_available(state, review_rounds):
             task = state.next_task if world.events else 'review'
             job = f'global.{task}.{sum(h["task"] == task for h in state.history)}'
-            self.stage('跨块合并与时间校验', round=state.rounds + 1, responsibility=task)
+            self.stage('未完成任务补救' if state.recovery_start_round is not None else '跨块合并与时间校验',
+                       round=state.rounds + 1, responsibility=task,
+                       recovery_round=(state.rounds - state.recovery_start_round + 1
+                                       if state.recovery_start_round is not None else None))
             delivery, information = await self._request_global_delivery(
                 task, job, chunks, world, state)
             submitted = delivery.model_copy(deep=True) if task == 'review' and delivery else None
@@ -1337,10 +1452,12 @@ class NovelExtractWorkflow:
             world, self.failures = candidate, remaining
             if state.accepted:
                 return world, True
-            if repeated:
+            if repeated and state.recovery_start_round is None:
                 self.failed('global.review', '重复出现同一未完成资料，停止空转；已有结果保留')
                 return world, False
-        self.failed('global.review', f'跨块合并与时间校验达到{state.rounds}轮，尚未获得稳定完整交付')
+        reason = (f'追加的{PARTIAL_RECOVERY_ROUNDS}轮补救已用尽' if state.recovery_start_round is not None
+                  else f'跨块合并与时间校验达到{state.rounds}轮')
+        self.failed('global.review', reason + '，尚未获得稳定完整交付')
         return world, False
 
     async def extract(self, text):

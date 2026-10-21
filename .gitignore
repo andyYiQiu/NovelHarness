@@ -9,8 +9,10 @@ logs/
 .tmp_test/
 reports/
 repository/
+databases/
 novel_data/
 HANDOFF*.md
 PROJECT_HANDOFF.md
 model/config.formal*.json
 .pytest_cache/
+.embedding_models/

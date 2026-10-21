@@ -1,4 +1,14 @@
+# Python 3.11+；项目唯一依赖清单。
+# 小说提取
 autogen-agentchat==0.7.5
 autogen-core==0.7.5
 pydantic==2.13.5
 httpx==0.28.1
+
+# Repository 入库和本地事件语义检索
+SQLAlchemy==2.0.55
+numpy==2.4.3
+faiss-cpu==1.13.2
+torch==2.10.0
+transformers==4.47.1
+einops==0.8.2

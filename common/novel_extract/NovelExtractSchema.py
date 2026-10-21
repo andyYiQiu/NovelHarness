@@ -830,6 +830,8 @@ def timeline_errors(topology, require_complete=False):
     nodes = {node.id: node for node in topology.time_nodes}
     orders = [node.order for node in nodes.values() if node.order is not None]
     errors = []
+    if require_complete and not topology.events:
+        errors.append('尚未提取任何核心事件，不能确认完成；请依据原文和故事主干补齐实际发生及时间归属，不得编造')
     if len(nodes) != len(topology.time_nodes):
         errors.append('time_nodes 节点编号重复')
     if len(orders) != len(set(orders)):

@@ -385,6 +385,12 @@ class DynamicWorkflowTests(unittest.TestCase):
                 for line in file.read_text().splitlines():
                     assert_no_evidence(json.loads(line))
         internal = harness.snapshots()
+        exported = {row['task_id']: row for node in timeline['nodes']
+                    for row in json.loads((root / 'timeline' / node['path']).read_text())['todolist']}
+        for event in internal['world']['events']:
+            task = exported[event['id']]
+            self.assertEqual(task['todo'], event['description'])
+            self.assertEqual(task['epistemic_status'], event['epistemic_status'])
         self.assertEqual(internal['world']['objects']['OBJ_1']['evidence'][0]['passage_ids'], ['C1_P1'])
         self.assertTrue(internal['world']['events'][0]['state_delta']['objects'][0]['evidence'][0]['quote'])
         self.assertTrue(internal['information']['initial_state']['objects']['OBJ_1']['evidence'])

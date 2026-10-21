@@ -153,15 +153,20 @@ class NovelExtractExporter:
             node = time_nodes[event.time_node_id]
             group = self.identifier(node.id)
             node_details[group] = (node.order if node_members[node.id] <= confirmed else None, node.name, node.relative)
-            groups[group].append({
+            task = {
                 'task_id': event.id, 'order': event.event_order if event.id in confirmed else None,
-                'todo': event.description + '\n依据性质：' + event.epistemic_status, 'time': event.source_time,
+                'todo': event.description, 'time': event.source_time,
                 'locations': [world.locations[event.at_location_id].name] if event.at_location_id else None,
                 'participants': [{'role_code': roles[key], 'role_name': world.entities[key].name,
                                   'original_goal': event.goals.get(key)} for key in people],
                 'items': [world.objects[key].name for key in event.object_ids] or None,
                 'required_results': event.required_results,
-            })
+            }
+            if self.storage.get('format', 37) >= 40:
+                task['epistemic_status'] = event.epistemic_status
+            else:  # 历史投影保留原字节，不能改写已保存的导出收据。
+                task['todo'] += '\n依据性质：' + event.epistemic_status
+            groups[group].append(task)
         nodes = []
         require(len({self.identifier(key) for key in time_nodes}) == len(time_nodes), '时间节点文件编号冲突')
         for node_id in sorted(groups, key=lambda key: (node_details[key][0] is None, node_details[key][0] or 0, key)):
@@ -245,6 +250,7 @@ class NovelExtractExporter:
         files, excluded = self.project(world)
         partial = self.storage.get('status') == 'partial'
         require(partial or self.storage.get('status') == 'complete', '尚未进入终态，不能发布正式输出')
+        require(partial or bool(world.events), '完整输出必须包含已提取的核心事件，不能发布空时间线')
         require(partial or self.storage.get('review_state', {}).get('accepted'), '完整输出必须先完成全局时间确认')
         require(partial or self.confirmed_event_ids(world) == {e.id for e in world.events},
                 '完整输出的时间确认缺失或依赖已变化')

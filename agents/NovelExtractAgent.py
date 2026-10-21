@@ -100,7 +100,11 @@ class NovelExtractAgent:
                     except ValueError:
                         previous = saved.get('response')
                     repair = {'previous_candidate': previous,
-                        'repair': '保留未被点名的内容，一次修复全部错误，返回符合当前协议的修订。',
+                        'repair': ('先按errors定位字段路径和要求，对照previous_candidate找出未满足处；'
+                                   '同一原因影响的字段一起修，不照抄失败内容或只改说明。'
+                                   '仅有候选和错误时只修交付结构，不猜原文事实；有原始依据时再据原文补缺。'
+                                   '保留未被点名的有效内容，核对关联字段后返回本次任务的完整修订，'
+                                   '不要只交差异或长篇解释。'),
                         'errors': saved['error']}
                     # 只有完整JSON候选的格式修复可省去原文；截断或缺候选须重交完整任务。
                     compact = (role == 'check' and isinstance(previous, dict)

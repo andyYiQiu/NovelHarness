@@ -347,7 +347,7 @@ class HarnessTests(unittest.TestCase):
         self.addCleanup(self.network.stop)
         self.addCleanup(self.temp.cleanup)
 
-    def run_pipeline(self, server, chunks=2, max_calls=1000, hook=None, text=None):
+    def run_pipeline(self, server, chunks=2, max_calls=1000, hook=None, text=None, extra_args=()):
         source = self.directory / 'source.txt'
         if not source.exists():
             source.write_text(text if text is not None else ('甲出发。\n\n' + '路旁有树。' * 190 + '\n\n') * chunks)
@@ -360,6 +360,7 @@ class HarnessTests(unittest.TestCase):
         args = ['--input', str(source), '--config', str(self.directory / 'config.json'),
                 '--workspace', str(self.workspace), '--output', str(self.output),
                 '--log-dir', str(self.directory / 'logs'), '--log-terminal', 'quiet', '--concurrency', '3']
+        args.extend(extra_args)
         original = httpx.AsyncClient
         def client(**kwargs):
             return original(**kwargs, transport=httpx.MockTransport(server.handle))
@@ -847,9 +848,10 @@ class HarnessTests(unittest.TestCase):
                 return result
         self.assertEqual(self.run_pipeline(RewordedIssues(), chunks=1), 2)
         state = NovelExtractStorage.read_status(self.workspace)['review_state']
-        self.assertEqual(state['rounds'], 3)
+        self.assertEqual(state['recovery_start_round'], 3)
+        self.assertEqual(state['rounds'], 9)
         self.assertTrue(state['confirmed_times'])
-        self.assertIn('停止空转', self.snapshots()['failures'][-1]['error'])
+        self.assertIn('6轮补救已用尽', self.snapshots()['failures'][-1]['error'])
 
     def test_flashback_conflict_is_repaired_and_checked_in_one_review(self):
         # 固定回复只验证错误排序→实际修订的交接，不宣称模型自动理解倒叙。
@@ -1150,7 +1152,8 @@ class HarnessTests(unittest.TestCase):
         server = FixtureServer('oscillate')
         self.assertEqual(self.run_pipeline(server), 2)
         state = NovelExtractStorage.read_status(self.workspace)['review_state']
-        self.assertLessEqual(state['rounds'], 8)
+        self.assertLessEqual(state['recovery_start_round'], 8)
+        self.assertEqual(state['rounds'], state['recovery_start_round'] + 6)
         self.assertFalse(state['accepted'])
         self.assertEqual(len(self.snapshots()['world']['events']), 2)
 
