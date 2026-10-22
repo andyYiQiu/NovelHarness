@@ -1,6 +1,6 @@
 # NovelHarness
 
-本系统是上游抽取系统：按小说原文建立人物、地点、世界背景、核心事件及故事时间线，完整交付 `repository`、可关联查询的 SQLite 及事件语义索引。技术路线是：**全文联合提取与核对 → 文本分块 → 两遍核心事件、关系和局部时间提取 → 结构修复 → 跨块合并与故事时间校验 → complete repository → SQLite → 事件向量入库及 FAISS**。使用 AutoGen；参照 [Shadow-Loom](https://github.com/dwlmt/shadow-loom) 的抽取、结构修复和跨块时间路线，自行实现所需部分。
+本系统是上游抽取系统：按小说原文建立人物、地点、世界背景、核心事件及故事时间线，完整交付 `repository` 和可关联查询的 SQLite。技术路线是：**全文联合提取与核对 → 文本分块 → 两遍核心事件、关系和局部时间提取 → 结构修复 → 跨块合并与故事时间校验 → complete repository → SQLite**。使用 AutoGen；参照 [Shadow-Loom](https://github.com/dwlmt/shadow-loom) 的抽取、结构修复和跨块时间路线，自行实现所需部分。
 
 提取完整性以原文支持的信息是否进入对应字段衡量，不以非空率衡量。汇集全文中同一对象的资料，保留相对年龄、约略时间、时期及转述限定；正文或传记提到的目的、结果、地点、物品状态仍须填写对应字段。已有核对负责补齐有据遗漏；确无依据的字段保持未知，不新增填表事件、检查阶段或非空门槛。`required_results`保存有据的实际结果与直接后果，`original_goal`保存参与者当时目的，二者不能混用。契约中保留的精确起止、时长、节点间隔仍为null，不为减少空值扩展时间研究范围。
 
@@ -12,7 +12,7 @@
 4. `global.timeline.*` 用各块局部时间草稿和全文，将现存事件归入按**故事实际开始时间**排列的节点。节点顺序唯一且连续；节点内事件可同号表示同时开始。全局交付须覆盖每个事件，不能按文本叙述顺序或块号直接排列。
 5. `global.review.*` 独立检查人物/关系/背景与原文是否一致、核心事件有无必要前因或结果缺失、实际发生是否被获知或讲述替代，以及全局故事时间。首轮覆盖全文；之后只处理具体未决问题或修订影响。模型批量提交修正，程序只核验可确定的结构、引用与覆盖，不要求逐候选、逐因果链或逐事件比较的正确证明表。
 6. Exporter 投影已保存资料，并按已确认故事顺序回放 delta，生成每个节点入口的 `state_before.json`。`timeline` 下是按顺序排列的时间节点，每节点包含事件；没有通过时间审读的 order 保持 `null`。未完成事实、候选和失败职责进入 `incomplete.json`，不会凭空补造输出。状态缺项、引用失效或同时更新冲突沿用全局检查反馈与修复，不新增模型阶段。
-7. 运行时指定 `--database`，工作流在 complete 导出并关闭工作区后调用现有工具：核对导出收据→写入公开 SQLite→以事件 todo 生成语义向量并保存→建立同名 `.faiss` 和收据。partial 不入库；全部后处理成功才返回0。后处理失败保留 complete 提取结果和已存向量，修复环境后原命令只继续后处理，不重新调用提取模型。省略 `--database` 时保留原来的仅提取用法。
+7. 运行时指定 `--database`，工作流在 complete 导出并关闭工作区后调用 ImportRepository：核对导出收据→写入公开 SQLite。partial 不入库；入库成功才返回0。入库失败保留 complete 提取结果，修复后原命令只继续入库，不重新调用提取模型。省略 `--database` 时保留原来的仅提取用法。
 
 “核心事件”指改变或删去后会改变故事主要因果链、转折、人物命运或结局的实际发生。`core_reason` 说明具体反事实影响。死亡与获知死讯、实施与申请、真实经历与后来的讲述分别建模；`story_spine` 和初提候选只是查漏线索，最终以原文为准。人物档案需记录身份、经历及有方向和适用阶段的关系，地点与世界背景也需保留原文支持的细节。
 
@@ -28,7 +28,7 @@
 
 ## 代码职责
 
-入口 `main.py` → `workflows/NovelExtractWorkflow.py`（唯一工作流、阶段、并行、恢复及完整交付）→ `agents/NovelExtractAgent.py`（独立 AutoGen 会话）→ `model/ModelClient.py`（HTTP和累计请求）→ `storage/novel_extract/NovelExtractStorage.py`（事务、锁、快照）→ `exporters/NovelExtractExporter.py`（输出）。Workflow 的 `prepare_paths` 检查输入和产物路径，`finish_repository` 只编排 ImportRepository 与 EventIndex，SQL、编码和索引细节仍在 tools 中。`common/novel_extract/NovelExtractSchema.py` 定义领域协议、引用与时间结构检查；`NovelExtractRevision.py` 只在副本上应用事实、时间和档案修订；`NovelExtractState.py` 只处理状态引用、相容 delta 合并和确定性回放，不推断事实或调用模型；Reader 保存原文块和证据位置；Log 写脱敏日志。历史库、报告、许可与配置是复现资料，不按是否被 import 判断有无用途。
+入口 `main.py` → `workflows/NovelExtractWorkflow.py`（唯一工作流、阶段、并行、恢复及完整交付）→ `agents/NovelExtractAgent.py`（独立 AutoGen 会话）→ `model/ModelClient.py`（HTTP和累计请求）→ `storage/novel_extract/NovelExtractStorage.py`（事务、锁、快照）→ `exporters/NovelExtractExporter.py`（输出）。Workflow 的 `prepare_paths` 检查输入和产物路径，`finish_repository` 只调用 ImportRepository，SQL 和原子入库细节仍在 tools 中。`common/novel_extract/NovelExtractSchema.py` 定义领域协议、引用与时间结构检查；`NovelExtractRevision.py` 只在副本上应用事实、时间和档案修订；`NovelExtractState.py` 只处理状态引用、相容 delta 合并和确定性回放，不推断事实或调用模型；Reader 保存原文块和证据位置；Log 写脱敏日志。历史库、报告、许可与配置是复现资料，不按是否被 import 判断有无用途。
 
 ## Repository 动态资产契约
 
@@ -89,7 +89,7 @@ repository/<输出名>/
   --database databases/作品_实验.sqlite3
 ```
 
-一个 repository 对应一个新数据库，采用 SQLite＋关联表＋JSON：十三张公开资料表，加一张派生的 `event_embeddings` 向量表。普通导入只创建空向量表，不加载模型或生成向量。`tools/database/table/` 中每张表由一个独立文件中的 Python 类定义，继承 `Base`，字段、外键和索引集中在对应类中。需要 SQLite 3.31 或更新版本，使用生成列约束引用的资产类型。
+一个 repository 对应一个新数据库，采用 SQLite＋关联表＋JSON：十三张公开资料表。`tools/database/table/` 中每张表由一个独立文件中的 Python 类定义，继承 `Base`，字段、外键和索引集中在对应类中。需要 SQLite 3.31 或更新版本，使用生成列约束引用的资产类型。
 
 文件职责：`database/Database.py` 定义模型基类和引擎配置；`database/table/<模型类名>.py` 各自定义一张表；`database/table/__init__.py` 只集中注册与导出类；`ImportRepository.py` 读取、检查文件并通过 `Session` 按类批量写入；`RepositoryReader.py` 保留标准库只读查询与状态回放。模块被 import 时不创建数据库或打开全局会话。原 `RepositorySchema.sql` 已由模型类替代，不维护两套表定义。普通文件使用大驼峰命名，`__init__.py` 为 Python 标准包入口。
 
@@ -102,7 +102,6 @@ repository/<输出名>/
 | `Asset` | `assets` |
 | `TimeNode` | `time_nodes` |
 | `Event` | `events` |
-| `EventEmbedding` | `event_embeddings` |
 | `StateSnapshot` | `state_snapshots` |
 | `EventParticipant` | `event_participants` |
 | `EventObject` | `event_objects` |
@@ -119,7 +118,6 @@ repository/<输出名>/
 | `assets` | `asset_type, asset_id, name` | `data_json`：人物、地点或物品档案 |
 | `time_nodes` | `node_id, node_order, node_name, time_relative` | `data_json`：原始节点 |
 | `events` | `task_id, node_id, event_order, todo, epistemic_status, time_text` | `data_json`：完整事件，含稀疏 `state_delta` |
-| `event_embeddings` | `vector_id, task_id, embedding_model, model_revision, embedding_task, dimension, text_hash` | `vector`：归一化 float32 小端 BLOB；`task_id` 唯一外键关联事件，整数 `vector_id` 对应 FAISS ID |
 | `state_snapshots` | `node_id, previous_node_id` | `data_json`：完整 `state_before` |
 | `event_participants` | `task_id, position, role_id, original_goal` | 通过人物外键读取档案 |
 | `event_objects` | `task_id, position, object_id` | 通过物品外键读取档案 |
@@ -135,7 +133,7 @@ repository/<输出名>/
 
 导入前检查当前公开契约的文件覆盖、编号、引用、两层顺序和状态结构；缺文件、空 order、空事件列表、悬空引用、重复 JSON 键或未识别的数据文件均明确报错，不跳过问题记录。合法的未知状态与可空描述允许保留。导入成功只表示这些存储检查通过，不替代原文语义验收，也不将上游 `partial` 改称 `complete`。
 
-建表及写入在同一个 `Session` 事务内完成，显式启用 SQLite 外键和事务，使建表也能回滚。按模型批量插入，显式保留 null，空集合不发 INSERT；不逐条 commit。释放连接后才原子发布；失败不留下半份目标库，已有目标一律拒绝覆盖。独立 CLI 重复导入需指定新路径。工作流恢复调用 `reuse_existing=True` 时，先按当前 complete repository 在临时库生成同一份公开投影，逐表比对已有库；十三张公开资料表完全一致才复用，向量缓存保留。不同或损坏的库拒收，不能凭文件名当成已入库。工具不追加或修改原事实。退出码为 0（成功）或 1（导入失败）；参数用法错误为 2。
+建表及写入在同一个 `Session` 事务内完成，显式启用 SQLite 外键和事务，使建表也能回滚。按模型批量插入，显式保留 null，空集合不发 INSERT；不逐条 commit。释放连接后才原子发布；失败不留下半份目标库，已有目标一律拒绝覆盖。独立 CLI 重复导入需指定新路径。工作流恢复调用 `reuse_existing=True` 时，先按当前 complete repository 在临时库生成同一份公开投影，逐表比对已有库；十三张公开资料表完全一致才复用，已有数据库不写入、不改表。不同或损坏的库拒收，不能凭文件名当成已入库。工具不追加或修改原事实。退出码为 0（成功）或 1（导入失败）；参数用法错误为 2。
 
 `tools/RepositoryReader.py` 提供只读查询，禁止写库且不会创建不存在的文件：
 
@@ -175,62 +173,9 @@ ORDER BY n.node_order, e.event_order, e.task_id, p.position;
 .quit
 ```
 
-## 事件语义向量与相似事件检索
-
-在 complete repository 成功入库后，工作流调用本地索引工具；也可使用下述独立命令。它只为已有事件生成派生向量，不参与事实提取、修订或时间排序，也不改变 repository 文件。历史数据库不自动升级；在明确指定的目标库上构建时，旧的十三表数据库仅补建向量表。
-
-参考 StoryBox，使用 `jinaai/jina-embeddings-v3`、512维。文档和查询明确使用对称语义匹配任务 `text-matching`；输入是事件的 `todo`，不拼接数据库编号、状态字段或依据性质。向量归一化后，由 `IndexIDMap(IndexFlatIP(512))` 作精确余弦近邻检索，不混入字面匹配或关键词重合分数。`vector_id` 与 `task_id` 显式映射，不以数据库行号或字符串编号推算。
-
-`tools/JinaEmbedding.py` 负责本地模型与编码；`tools/EventIndex.py` 负责向量缓存、索引发布和查询；`tools/database/table/EventEmbedding.py` 只定义表。PyTorch 和 FAISS 在部分 Mac 环境存在 OpenMP 冲突，因此编码器使用一个延迟启动、跨批复用的独立进程；FAISS 在调用进程中运行。使用 `with JinaEmbedding(...)` 或 `close()` 释放编码进程。不会对每条事件重新加载模型，也不会自动调用 API。
-
-编码需要本地完整 Jina v3 目录：权重、分词器、配置以及匹配的官方 Python 实现（含相对导入文件）。默认路径是 `.embedding_models/JinaV3/`，也可指定 `--model-path`。本机已从已有缓存核对文件哈希并准备该目录；模型文件不随代码提交，其他机器需自行准备。编码进程强制离线，不下载权重或代码。默认 CPU，本机验收为 Mac arm64/CPU；CUDA/MPS 参数可传入，但本轮未验证。
-
-以下使用已入库且停止写入的数据库；构建会向该库新增向量记录，需保全原库时先制作 SQLite 备份副本：
-
-```bash
-.venv/bin/python -B tools/EventIndex.py build \
-  --database databases/作品_实验.sqlite3 \
-  --index databases/作品_实验.faiss
-
-# 以一个已存在的事件找相似事件，自动排除自身；不需要加载模型。
-.venv/bin/python -B tools/EventIndex.py search \
-  --database databases/作品_实验.sqlite3 \
-  --index databases/作品_实验.faiss \
-  --event 事件ID --k 5
-
-# 新事件描述使用同一套语义编码配置。
-.venv/bin/python -B tools/EventIndex.py search \
-  --database databases/作品_实验.sqlite3 \
-  --index databases/作品_实验.faiss \
-  --text '雇主解雇了工人，他被迫离开工厂。' --k 5
-```
-
-返回结果按相似度降序排列，包含 `vector_id/task_id/score`、完整事件、节点及对应人物、地点、物品档案。下游 Python 用法：
-
-```python
-from tools.EventIndex import EventIndex
-from tools.JinaEmbedding import JinaEmbedding
-
-with EventIndex("databases/作品_实验.sqlite3", "databases/作品_实验.faiss") as index:
-    related = index.search_event("事件ID", k=5)
-    with JinaEmbedding() as encoder:
-        matched = index.search_text("他失去了工作，不得不离开工厂。", encoder, k=5)
-```
-
-每库仅使用一套模型、权重/分词器/实现文件哈希、任务和维度，查询配置必须一致。`text_hash` 判断事件内容是否变化；已完成的批次逐批提交，中断续建只编码缺失或变化项。同一库只能有一个构建进程；向量缺失、过期或配置不同会明确报错。FAISS 文件与 `.faiss.json` 收据完整发布后才可查询，收据绑定数据库内容和索引哈希；不同内容不覆盖旧索引。事件内容合法更新后用新的索引路径重建，可复用未变向量；模型配置更换应从 repository 导入独立新库，不混用旧向量。已有事件检索完全使用 SQLite 中的向量，即使本地模型不在也可工作。
-
-查看向量编号映射（512维每条向量2048字节）：
-
-```bash
-sqlite3 -readonly -header -box databases/作品_实验.sqlite3 \
-  'SELECT vector_id,task_id,embedding_model,embedding_task,dimension,length(vector) AS vector_bytes FROM event_embeddings;'
-```
-
-余弦分数是相关候选的排序依据，不是概率，也不是事件等价、因果或事实一致性的证明。本轮6组中文对照中，5组将语义改写排在词汇重叠干扰项之前；“拒绝包办婚姻并私奔”一组仍把“接受安排成婚”略排在正确改写之前。保留该失败反例，不用固定向量测试冒充语义验收，也不据此自动合并或改写事件。这个小样本不能代表真实小说检索准确率。
-
 ## 运行与验证
 
-使用 Python 3.11+、项目 `.venv` 和根目录唯一的依赖文件。提取、入库、向量化的已验证版本统一维护，不另设 tools 内依赖清单：
+使用 Python 3.11+、项目 `.venv` 和根目录唯一的依赖文件。提取和入库的已验证版本统一维护，不另设 tools 内依赖清单：
 
 ```bash
 .venv/bin/python -m pip install -r requirements.txt
@@ -252,13 +197,12 @@ cp model/config.example.json model/config.local.json
   --output repository/作品_新实验 \
   --log-dir logs/novel_extract/作品_新实验 \
   --database databases/作品_新实验.sqlite3 \
-  --embedding-model .embedding_models/JinaV3 \
   --max-steps 1000 --concurrency 16 --preflight
 ```
 
-这是一条完整流程的预检命令：除原有输入、配置和路径检查，还验证后处理依赖与本地模型文件是否准备好，拒绝新实验占用已有数据库/索引或把产物写入原文、工作区和模型目录；不创建工作区、不编码、不调用 API。正式执行去掉 `--preflight`，须另获实验授权。本次整理没有启动实验。
+这是一条完整流程的预检命令：检查依赖、配置、分块和路径，拒绝新实验占用已有数据库或把产物写入原文、配置与工作区；不创建工作区、不调用 API。正式执行去掉 `--preflight`，须另获实验授权。
 
-指定 `--database` 时，成功产物为 repository、该 SQLite、同名 `.faiss` 和 `.faiss.json` 收据。省略此参数则仅提取；不是完整入库/索引流程。工作区的 `complete` 仍表示小说提取及 repository 完成，后处理失败不会把它倒退为 working；整条命令返回1并说明失败位置，不能向下游宣称索引已经可用。原命令重试会核对相同公开资料并复用已存向量，全部成功才打印“完整交付”并返回0。
+指定 `--database` 时，成功产物为 repository 和该 SQLite。省略此参数则仅提取。工作区的 `complete` 仍表示小说提取及 repository 完成，入库失败不会把它倒退为 working；整条命令返回1并说明失败位置。原命令重试会逐表核对已有公开库，仅内容完全一致才复用，全部成功才打印“完整交付”并返回0。
 
 密钥只从配置指定的环境变量读取，不写入命令或聊天。`--max-steps`限制累计 HTTP 尝试（含重试和未知请求），不代表金额。只读状态命令：
 
@@ -266,7 +210,7 @@ cp model/config.example.json model/config.local.json
 .venv/bin/python -B main.py --workspace .novel_agent_work/作品_实验.sqlite3 --status
 ```
 
-新工作区格式 **40**；格式1—39仅可只读查看，不能直接用新代码续跑或把旧全文关系推断成动态状态。本轮工作流与依赖整理改变了运行指纹；历史工作区不直接用新入口续跑，其已有 complete repository 仍可通过独立工具入库和建索引，无需重做小说提取。相同输入、配置、代码指纹和路径的 `working` 工作区可原命令恢复；`complete/partial` 终态同命令不新增提取请求，指定 `--database` 的 complete 结果继续核对后处理。退出码：0 请求的流程全部完成，2 提取部分完成，75 运行条件暂停，130 用户中断，1 配置、路径或后处理错误。
+新工作区格式 **40**；格式1—39仅可只读查看，不能直接用新代码续跑或把旧全文关系推断成动态状态。工作流与依赖修改会改变运行指纹；历史工作区不直接用新入口续跑，其已有 complete repository 仍可通过独立工具入库，无需重做小说提取。相同输入、配置、代码指纹和路径的 `working` 工作区可原命令恢复；`complete/partial` 终态同命令不新增提取请求，指定 `--database` 的 complete 结果继续核对后处理。退出码：0 请求的流程全部完成，2 提取部分完成，75 运行条件暂停，130 用户中断，1 配置、路径或后处理错误。
 
 离线回归：
 

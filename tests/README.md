@@ -22,15 +22,4 @@
 
 `TestRepairFeedback.py` 验证未接收候选保留稀疏null、接收/拒收分离、关系两端与非参与者状态引用、依据回执显式清理删除引用、单独时间拒收的候选交接、成功修订回执及事务中断恢复。测试只证明反馈与执行通路，不证明模型自主推理的正确率。
 
-`TestEventIndex.py` 验证第十四张派生向量表、显式编号映射、分批中断续建、收据发布、原事实不变、内容变更失效、模型配置拒绝混用、索引损坏拒收及按得分关联资料。固定向量仅测工程通路。需安装 `requirements.txt`；未安装索引依赖时跳过该模块，已有提取和入库测试仍可运行。
-
-真实模型编码/建库/检索集成用例，以及 `TestEventEmbeddingSemantics.py` 的6组中文语义排序对照，只有设置 `NOVEL_JINA_MODEL_PATH` 才运行。模型须预先位于本机，编码进程离线运行：
-
-```bash
-NOVEL_JINA_MODEL_PATH="$PWD/.embedding_models/JinaV3" \
-  .venv/bin/python -B -m unittest discover -s tests -p 'TestEvent*.py' -v
-```
-
-当前真实集成通过；语义对照5/6符合预期，“拒绝包办婚姻并私奔”这一例失败，测试保留失败断言，不能将其当成全部通过。它测的是同义改写优先于表面相似但发生不同的描述，不是完整检索质量基准。默认离线回归不加载真实模型，因此真实模型测试显式跳过；默认通过不代表语义质量通过。
-
-`TestWorkflowDelivery.py` 验证现有 Workflow 的 --database 完整交接：complete 导出→SQLAlchemy 入库→向量缓存→FAISS→关联查询，partial 不执行后处理，编码/索引收据失败后的续做不增加提取请求，已有资料被改动时拒绝复用，预检不写库且缺模型或目标冲突在模型请求前失败。设置 NOVEL_JINA_MODEL_PATH 后还用本地真实 Jina 跑一次固定提取回复的完整链路；它不发提取 API 请求，不是新小说实验。终态重跑必须复用全部向量。
+`TestWorkflowDelivery.py` 验证现有 Workflow 的 --database 交接：complete 导出→SQLAlchemy 十三表入库→关联查询与状态回放；partial 不入库，写库失败或发布后中断重试不增加提取请求，已有资料被修改时拒绝复用，预检不写库且目标占用/路径冲突在模型请求前失败。重复交接保持数据库与 repository 不变，已有历史附加表保留，新库不生成事件向量表或索引。全部使用固定提取回复与断网保护。

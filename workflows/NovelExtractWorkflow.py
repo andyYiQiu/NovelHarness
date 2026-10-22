@@ -73,15 +73,13 @@ def substantive_world(world):
 
 class NovelExtractWorkflow:
     def arguments(self, argv=None):
-        parser = argparse.ArgumentParser(description='AutoGen：小说提取 → repository；指定 --database 后继续 SQLite 入库与事件语义索引')
+        parser = argparse.ArgumentParser(description='AutoGen：小说提取 → repository；指定 --database 后继续 SQLite 入库')
         parser.add_argument('--input', type=Path)
         parser.add_argument('--config', type=Path, default=Path('model/config.local.json'))
         parser.add_argument('--workspace', type=Path, required=True)
         parser.add_argument('--output', type=Path)
         parser.add_argument('--log-dir', type=Path)
-        parser.add_argument('--database', type=Path, help='complete 导出后自动入库并建立同名 .faiss 索引；省略时只提取')
-        parser.add_argument('--embedding-model', type=Path, default=ROOT / '.embedding_models/JinaV3',
-                            help='完整本地 Jina v3 模型目录，仅 --database 流程使用')
+        parser.add_argument('--database', type=Path, help='complete 导出后自动写入 SQLite；省略时只提取')
         parser.add_argument('--max-steps', type=int, default=1000, help='累计 HTTP 请求上限，含重试；同时受配置 max_calls 约束')
         parser.add_argument('--max-request-chars', type=int, default=0, help='完整请求字符限制；0 不另加限制，接口仍有上下文限制')
         parser.add_argument('--concurrency', type=int, default=16, help='最大并行文本块数；不并行同块依赖步骤')
@@ -110,56 +108,40 @@ class NovelExtractWorkflow:
             print('未完成：' + str(exc))
             return 1
 
-    @staticmethod
-    def database_paths(args):
-        database = safe_path(args.database)
-        return database, safe_path(database.with_suffix('.faiss'))
-
     def prepare_paths(self, args, source_path, config_path):
-        """统一检查提取和后处理路径，提前发现缺模型、目标占用或产物重叠。"""
+        """统一检查提取和入库路径，提前发现目标占用或产物重叠。"""
         output, log_dir, workspace = safe_path(args.output), safe_path(args.log_dir), safe_path(args.workspace)
         # 输出发布与日志/数据库不得互相包含，更不能覆盖输入。
         require(not output.exists() or output.is_dir(), '输出路径不是目录')
         paths = (output, log_dir, workspace)
         protected = (source_path, config_path)
         if args.database:
-            # 在可能产生付费请求前检查收尾工具、模型及路径；这里不加载模型或编码。
-            import_module('tools.EventIndex')
-            from tools.JinaEmbedding import JinaEmbedding
-
-            database, index = self.database_paths(args)
-            model_path = safe_path(args.embedding_model)
-            JinaEmbedding(model_path)
-            delivery_paths = (database, index, safe_path(Path(str(index) + '.json')))
-            paths += (*delivery_paths, safe_path(Path(str(database) + '.embedding.lock')))
-            protected += (model_path,)
-            if any(path.exists() for path in delivery_paths):
+            # 在可能产生付费请求前检查入库依赖及路径；此处不打开数据库。
+            import_module('tools.ImportRepository')
+            database = safe_path(args.database)
+            paths += (database,)
+            if database.exists():
                 require(workspace.exists() and NovelExtractStorage.read_status(workspace).get('status') == 'complete',
-                        '仅 complete 的后处理可复用已有产物；新实验的数据库和索引须使用新路径')
+                        '仅 complete 的后处理可复用已有产物；新实验的数据库须使用新路径')
         require(all(left != right and left not in right.parents and right not in left.parents
-                    for index, left in enumerate(paths) for right in paths[index + 1:]), '输出、日志、工作区、数据库及索引路径不能重叠')
+                    for index, left in enumerate(paths) for right in paths[index + 1:]), '输出、日志、工作区和数据库路径不能重叠')
         require(all(path != source and path not in source.parents and source not in path.parents
-                    for path in paths for source in protected), '产物路径不能覆盖输入、配置或模型目录')
+                    for path in paths for source in protected), '产物路径不能覆盖输入或配置')
         return output, log_dir, workspace
 
     def finish_repository(self, args):
-        """收尾只编排现有工具；失败保全 complete 提取和已保存的向量批次。"""
+        """收尾调用现有入库工具；失败保全 complete 提取，重试不重新提取。"""
         from sqlalchemy.exc import DBAPIError, SQLAlchemyError
-        from tools.EventIndex import build_index
         from tools.ImportRepository import import_repository
-        from tools.JinaEmbedding import JinaEmbedding
 
-        database, index = self.database_paths(args)
+        database = safe_path(args.database)
         try:
             print('repository 已 complete，正在核对并写入 SQLite……')
-            import_repository(args.output, database, workspace=args.workspace, reuse_existing=True)
-            print('SQLite 已就绪，正在生成或复用事件向量与 FAISS 索引……')
-            with JinaEmbedding(args.embedding_model) as encoder:
-                result = build_index(database, index, encoder)
+            counts = import_repository(args.output, database, workspace=args.workspace, reuse_existing=True)
         except (OSError, ValueError, RuntimeError, SQLAlchemyError) as exc:
             detail = exc.orig if isinstance(exc, DBAPIError) else exc
-            raise ValueError(f'提取结果已保留，入库/索引未完成：{detail}；修复后可用同一命令继续后处理') from exc
-        print('完整交付：' + json.dumps({'repository': str(args.output), 'database': str(database), **result},
+            raise ValueError(f'提取结果已保留，入库未完成：{detail}；修复后可用同一命令继续入库') from exc
+        print('完整交付：' + json.dumps({'repository': str(args.output), 'database': str(database), 'tables': counts},
                                     ensure_ascii=False))
 
     def execute(self, args):

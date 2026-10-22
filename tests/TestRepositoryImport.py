@@ -116,8 +116,7 @@ class RepositoryImportTests(unittest.TestCase):
         self.assertEqual(counts, {"repository_info": 1, "assets": 5, "time_nodes": 2, "events": 3, "state_snapshots": 2,
                                   "event_participants": 3, "event_objects": 0, "event_locations": 3,
                                   "relation_snapshots": 2, "object_snapshots": 2,
-                                  "relation_changes": 1, "object_changes": 1, "world_data": 2,
-                                  "event_embeddings": 0})
+                                  "relation_changes": 1, "object_changes": 1, "world_data": 2})
         with closing(sqlite3.connect(self.database)) as connection:
             tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             self.assertEqual(tables, {"repository_info", *counts})

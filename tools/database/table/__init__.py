@@ -4,7 +4,6 @@ from .WorldData import WorldData
 from .Asset import Asset
 from .TimeNode import TimeNode
 from .Event import Event
-from .EventEmbedding import EventEmbedding
 from .StateSnapshot import StateSnapshot
 from .EventParticipant import EventParticipant
 from .EventObject import EventObject

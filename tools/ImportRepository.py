@@ -384,22 +384,18 @@ def completed_export(root, workspace):
 
 
 def matching_database(expected, target):
-    """恢复交接时逐表比对公开资料；向量缓存除外，不以文件名猜测所属作品。"""
+    """恢复交接时逐表比对十三张公开资料表，不以文件名猜测所属作品。"""
     with closing(sqlite3.connect(expected.as_uri() + '?mode=ro', uri=True)) as source, \
          closing(sqlite3.connect(target.resolve().as_uri() + '?mode=ro', uri=True)) as current:
         current.execute('BEGIN')
         counts = {}
         for name, table in Base.metadata.tables.items():
-            if name == models.EventEmbedding.__tablename__:
-                continue
             columns = ','.join('"' + column.name + '"' for column in table.columns)
             query = f'SELECT {columns} FROM "{name}" ORDER BY {columns}'
             rows = current.execute(query).fetchall()
             require(source.execute(query).fetchall() == rows,
                     target, f'已有数据库的 {name} 与 complete repository 不一致，拒绝复用或覆盖')
             counts[name] = len(rows)
-        cached = current.execute("SELECT 1 FROM sqlite_master WHERE name='event_embeddings' AND type='table'").fetchone()
-        counts['event_embeddings'] = current.execute('SELECT count(*) FROM event_embeddings').fetchone()[0] if cached else 0
         return counts
 
 
